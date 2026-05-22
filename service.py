@@ -523,38 +523,64 @@ def add_meal_item(
     product_id: int,
     measure_id: int,
     measure_quantity: float,
+    food_type: str = "PRODUCT",
 ) -> dict:
-    """Append a PRODUCT meal item via the whole-day POST endpoint."""
+    """Append a meal item via the whole-day POST endpoint.
+
+    `food_type` is `"PRODUCT"` (default) or `"RECIPE"`. When `RECIPE`, `product_id`
+    is interpreted as a recipe id; the item is written with `foodType="RECIPE"`,
+    `recipeId=<id>`, and `ingredientsServing=<recipe.serving>` so server-side
+    nutrition math matches Fitatu's web app.
+    """
     _validate_day_date(date)
     _validate_meal_key(meal_key)
     if measure_quantity <= 0:
         raise ValueError(f"measure_quantity must be > 0 (got {measure_quantity})")
+    food_type_u = (food_type or "PRODUCT").upper()
+    if food_type_u not in {"PRODUCT", "RECIPE"}:
+        raise ValueError(f"food_type must be PRODUCT or RECIPE (got {food_type!r})")
 
-    # Verify product + measure are real (catches typos early; not strictly required server-side).
-    product = _resolve_product_for_meal_item(db, client, product_id)
-    measures = product.get("measures") or []
-    if not any(m.get("id") == measure_id for m in measures):
-        raise ValueError(
-            f"measure_id {measure_id} not present in product {product_id}.measures[]"
-        )
+    if food_type_u == "PRODUCT":
+        # Verify product + measure exist (catches typos early; server is lenient).
+        product = _resolve_product_for_meal_item(db, client, product_id)
+        measures = product.get("measures") or []
+        if not any(m.get("id") == measure_id for m in measures):
+            raise ValueError(
+                f"measure_id {measure_id} not present in product {product_id}.measures[]"
+            )
+        recipe_serving: int | None = None
+    else:
+        try:
+            recipe = client.get_recipe(product_id)
+        except RuntimeError as exc:
+            raise ValueError(f"recipe {product_id} not found: {exc}") from exc
+        measures = recipe.get("measures") or []
+        if not any(m.get("id") == measure_id for m in measures):
+            raise ValueError(
+                f"measure_id {measure_id} not present in recipe {product_id}.measures[]"
+            )
+        recipe_serving = recipe.get("serving") or recipe.get("numberOfPortions")
 
     envelope = _load_day_envelope_for_write(client, date)
     items = _ensure_meal_slot(envelope, meal_key)
 
     plan_id = client._gen_uuid()
-    new_item = {
+    new_item: dict = {
         "planDayDietItemId": plan_id,
-        "foodType": "PRODUCT",
+        "foodType": food_type_u,
         "measureId": measure_id,
         "measureQuantity": measure_quantity,
-        "ingredientsServing": None,
+        "ingredientsServing": recipe_serving if food_type_u == "RECIPE" else None,
         "mealNumber": None,
         "numberOfMeals": None,
         "eaten": False,
-        "productId": product_id,
         "source": "API",
         "updatedAt": _now_updated_at(),
     }
+    if food_type_u == "PRODUCT":
+        new_item["productId"] = product_id
+    else:
+        new_item["recipeId"] = product_id
     items.append(new_item)
 
     response = client.post_day(date, envelope)

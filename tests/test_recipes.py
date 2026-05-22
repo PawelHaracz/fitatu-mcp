@@ -167,6 +167,39 @@ def test_mcp_create_recipe_forwards_tags(app_mcp):
     assert payload["tags"][1]["category"] == "RECIPE_TAG_USERS_TYPE"
 
 
+def test_mcp_create_recipe_normalizes_literal_backslash_n_in_description(app_mcp):
+    """Callers that JSON-double-escape newlines send '\\n' literals; we must convert them."""
+    app, mcp = app_mcp
+    items = json.dumps([{"type": "PRODUCT", "itemId": 1, "measureId": 1, "measureQuantity": 1}])
+    # Literal backslash-n (2 chars) — what we want to be normalized into a real newline
+    desc_in = "Krok 1: gotuj.\\n\\nKrok 2: podawaj."
+    with patch("mcp_server.fitatu_client.FitatuClient.create_recipe", return_value={"id": 1, "name": "x", "energy": 0, "protein": 0, "fat": 0, "carbohydrate": 0}) as mock_create:
+        _call_tool_sync(mcp, "create_recipe", {
+            "name": "x",
+            "items_json": items,
+            "recipe_description": desc_in,
+        })
+    payload = mock_create.call_args.args[0]
+    assert "\\n" not in payload["recipeDescription"]
+    assert "\n\n" in payload["recipeDescription"]
+    assert payload["recipeDescription"] == "Krok 1: gotuj.\n\nKrok 2: podawaj."
+
+
+def test_mcp_create_recipe_preserves_real_newlines(app_mcp):
+    """Callers sending real newline characters should be passed through unchanged."""
+    app, mcp = app_mcp
+    items = json.dumps([{"type": "PRODUCT", "itemId": 1, "measureId": 1, "measureQuantity": 1}])
+    desc_in = "Krok 1.\n\nKrok 2."  # real newline
+    with patch("mcp_server.fitatu_client.FitatuClient.create_recipe", return_value={"id": 1, "name": "x", "energy": 0, "protein": 0, "fat": 0, "carbohydrate": 0}) as mock_create:
+        _call_tool_sync(mcp, "create_recipe", {
+            "name": "x",
+            "items_json": items,
+            "recipe_description": desc_in,
+        })
+    payload = mock_create.call_args.args[0]
+    assert payload["recipeDescription"] == desc_in
+
+
 def test_mcp_create_recipe_rejects_empty_name(app_mcp):
     app, mcp = app_mcp
     items = json.dumps([{"type": "PRODUCT", "itemId": 1, "measureId": 1, "measureQuantity": 1}])

@@ -560,10 +560,13 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
     @mcp.tool(
         name="add_meal_item",
         description=(
-            "Log a meal item: 'I ate X amount of product Y for breakfast on date Z'. "
+            "Log a meal item: 'I ate X amount of product/recipe Y for breakfast on date Z'. "
             "Pass date (YYYY-MM-DD), meal_key (breakfast|second_breakfast|lunch|dinner|snack|supper), "
-            "product_id (from search_products or create_custom_product), "
-            "measure_id (from product's measures[].id), measure_quantity (number of servings)."
+            "product_id (from search_products / create_custom_product / create_recipe — "
+            "treat as recipe id when food_type='RECIPE'), "
+            "measure_id (from product/recipe's measures[].id; for recipes typically 39='porcja' or 1='g'), "
+            "measure_quantity (number of measures, e.g. 1 porcja or 100 g). "
+            "food_type='PRODUCT' (default) or 'RECIPE'."
         ),
     )
     def mcp_add_meal_item(
@@ -572,6 +575,7 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         product_id: int,
         measure_id: int,
         measure_quantity: float,
+        food_type: str = "PRODUCT",
     ) -> dict:
         if product_id <= 0:
             raise ValueError("product_id must be a positive integer")
@@ -579,6 +583,7 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         with SessionLocal() as db:
             result = service.add_meal_item(
                 db, client, date, meal_key, product_id, measure_id, measure_quantity,
+                food_type=food_type,
             )
             db.commit()
             return result
@@ -685,14 +690,26 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
                     raise ValueError(f"tags_json[{i}] must include 'name' and 'category'")
                 t.setdefault("translation", t["name"])
 
+        # Some callers double-escape newlines, sending literal "\\n" / "\\r" sequences
+        # instead of real control characters. Fitatu's web client renders the raw string,
+        # so we normalize here before posting.
+        recipe_description_clean = (
+            recipe_description
+            .replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\r", "\n")
+            .replace("\\t", "\t")
+        )
+        preparation_time_clean = preparation_time.replace("\\n", "\n").replace("\\r", "\n")
+
         payload: dict = {
             "categories": None,
             "cookingTime": cooking_time,
             "items": items,
             "mealSchema": meal_schema,
             "name": name_clean,
-            "preparationTime": preparation_time,
-            "recipeDescription": recipe_description,
+            "preparationTime": preparation_time_clean,
+            "recipeDescription": recipe_description_clean,
             "serving": str(serving),
             "shared": bool(shared),
             "tags": tags,

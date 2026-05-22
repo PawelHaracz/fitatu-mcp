@@ -264,6 +264,13 @@ class FitatuClient:
             raise RuntimeError(f"get_recipe_tags failed: {response.status_code} {response.text[:200]}")
         return response.json()
 
+    def get_recipe(self, recipe_id: int) -> dict[str, Any]:
+        """GET /api/recipes/{id} — full recipe detail incl. measures[]."""
+        response = self._request("GET", f"/api/recipes/{recipe_id}")
+        if response.status_code != 200:
+            raise RuntimeError(f"get_recipe failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
     def create_recipe(self, payload: dict) -> dict[str, Any]:
         """POST /api/recipes — create a user recipe.
 

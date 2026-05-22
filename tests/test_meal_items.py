@@ -187,6 +187,78 @@ def test_add_meal_item_rejects_unknown_measure():
             service.add_meal_item(db, client, "2026-05-22", "lunch", 555, 99, 1.0)
 
 
+def test_add_meal_item_recipe_uses_get_recipe_and_writes_recipe_shape():
+    """food_type=RECIPE → look up recipe.measures[], write recipeId + ingredientsServing."""
+    from mcp_server import service
+
+    client = _make_client()
+    posted: dict = {}
+
+    def fake_post_day(date, envelope):
+        posted["envelope"] = envelope
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {}
+        return resp
+
+    fake_recipe = {
+        "id": 145394529,
+        "name": "Pyry z gzikiem",
+        "serving": 2,
+        "measures": [
+            {"id": 1, "name": "g", "weightPerUnit": 1},
+            {"id": 39, "name": "porcja", "weightPerUnit": 650},
+        ],
+    }
+    with patch.object(client, "get_day", return_value=_existing_day_payload()), \
+         patch.object(client, "get_recipe", return_value=fake_recipe) as mock_get_recipe, \
+         patch.object(client, "post_day", side_effect=fake_post_day), \
+         patch("mcp_server.service.sync_day_from_fitatu", side_effect=_mock_sync_returning_empty):
+        db = MagicMock()
+        db.get.return_value = None
+        result = service.add_meal_item(
+            db, client,
+            date="2026-05-22",
+            meal_key="supper",
+            product_id=145394529,
+            measure_id=39,
+            measure_quantity=1.0,
+            food_type="RECIPE",
+        )
+
+    assert result["ok"] is True
+    mock_get_recipe.assert_called_once_with(145394529)
+    new_pid = result["plan_day_diet_item_id"]
+    items = posted["envelope"]["dietPlan"]["supper"]["items"]
+    new = next(i for i in items if i["planDayDietItemId"] == new_pid)
+    assert new["foodType"] == "RECIPE"
+    assert new["recipeId"] == 145394529
+    assert "productId" not in new
+    assert new["measureId"] == 39
+    assert new["measureQuantity"] == 1.0
+    assert new["ingredientsServing"] == 2  # mirrors recipe.serving
+    assert new["eaten"] is False
+    assert new["source"] == "API"
+
+
+def test_add_meal_item_recipe_rejects_unknown_measure():
+    from mcp_server import service
+
+    client = _make_client()
+    fake_recipe = {"id": 1, "name": "R", "serving": 1, "measures": [{"id": 39, "name": "porcja", "weightPerUnit": 200}]}
+    with patch.object(client, "get_recipe", return_value=fake_recipe):
+        db = MagicMock()
+        with pytest.raises(ValueError, match=r"measure_id 99 not present in recipe 1"):
+            service.add_meal_item(db, client, "2026-05-22", "supper", 1, 99, 1.0, food_type="RECIPE")
+
+
+def test_add_meal_item_rejects_invalid_food_type():
+    from mcp_server import service
+
+    client = _make_client()
+    db = MagicMock()
+    with pytest.raises(ValueError, match="food_type"):
+        service.add_meal_item(db, client, "2026-05-22", "supper", 1, 1, 1.0, food_type="MEAL")
+
+
 # ---- 9.2 update: mutates in place, same planDayDietItemId, bumps updatedAt ----
 
 
