@@ -1,6 +1,11 @@
 """Group 9 tests: meal-item write tools (add/update/delete).
 
-Spec §15 — the user's PRIMARY goal: log/edit/delete what they ate.
+Spec §15 / discovery 2026-05-22:
+The Fitatu web client persists day mutations through ONE endpoint:
+  POST /api/diet-plan/{userId}/days  with body {"<date>": <day_envelope>}
+
+Add = append item. Update = mutate measureQuantity + bump updatedAt.
+Delete = mark deletedAt (soft). Server is source of truth for nutrition.
 """
 
 from __future__ import annotations
@@ -31,213 +36,256 @@ def _tool_names(mcp) -> list[str]:
     return [t.name for t in tools]
 
 
-# -- 9.1 add_meal_item happy path --
+# ---- helpers shared across tests ----
 
 
-def test_add_meal_item_happy_path():
-    """add_meal_item builds correct payload + UUID v1 + nutrition pro-rated + sync called."""
-    from mcp_server import service
+def _make_client():
     from mcp_server.fitatu_client import FitatuClient
 
     client = FitatuClient("u", "p")
     client.token = "tok"
     client.user_id = "42"
+    return client
 
-    product = {
-        "id": 555,
+
+def _existing_day_payload() -> dict:
+    """One pre-existing PRODUCT item + one RECIPE item across two slots."""
+    return {
+        "dietPlan": {
+            "second_breakfast": {
+                "items": [
+                    {
+                        "planDayDietItemId": "old-product-uuid",
+                        "foodType": "PRODUCT",
+                        "measureId": 1,
+                        "measureQuantity": 70,
+                        "ingredientsServing": None,
+                        "mealNumber": None,
+                        "numberOfMeals": None,
+                        "eaten": False,
+                        "productId": 555,
+                        "source": "API",
+                    },
+                ]
+            },
+            "dinner": {
+                "items": [
+                    {
+                        "planDayDietItemId": "old-recipe-uuid",
+                        "foodType": "RECIPE",
+                        "measureId": 39,
+                        "measureQuantity": 1,
+                        "ingredientsServing": 8,
+                        "eaten": False,
+                        "recipeId": 99999,
+                        "source": "API",
+                    },
+                ]
+            },
+        },
+        "toiletItems": [],
+        "note": None,
+        "tagsIds": [],
+    }
+
+
+def _make_product(id_=555, measures=None):
+    return {
+        "id": id_,
         "name": "Banana",
         "energy": 89,
         "protein": 1.1,
         "fat": 0.3,
         "carbohydrate": 22.8,
-        "fiber": 2.6,
-        "sugars": 12.2,
-        "salt": 0.0,
-        "measures": [{"id": 1, "name": "100g", "weightPerUnit": 100.0}],
+        "measures": measures or [{"id": 1, "name": "100g", "weightPerUnit": 100.0}],
     }
 
-    captured: dict = {}
 
-    def fake_post_day_items(date, items):
-        captured["date"] = date
-        captured["items"] = items
-        resp = MagicMock()
-        resp.status_code = 201
-        resp.json.return_value = {"ok": True}
+def _mock_sync_returning_empty(db, client, day):
+    from mcp_server.schemas import DaySummarySchema
+    return DaySummarySchema(user_id="42", day_date=day, meals=[])
+
+
+# ---- 9.1 add: appends to existing items + posts whole day ----
+
+
+def test_add_meal_item_appends_and_posts_whole_day():
+    from mcp_server import service
+
+    client = _make_client()
+    posted: dict = {}
+
+    def fake_post_day(date, envelope):
+        posted["date"] = date
+        posted["envelope"] = envelope
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {}
         return resp
 
-    def fake_sync(db, c, day):
-        from mcp_server.schemas import DaySummarySchema
-        return DaySummarySchema(user_id="42", day_date=day, meals=[])
-
-    with patch.object(client, "get_product", return_value=product) as mock_get, \
-         patch.object(client, "post_day_items", side_effect=fake_post_day_items) as mock_post, \
-         patch("mcp_server.service.sync_day_from_fitatu", side_effect=fake_sync):
-
+    with patch.object(client, "get_day", return_value=_existing_day_payload()), \
+         patch.object(client, "get_product", return_value=_make_product(555)), \
+         patch.object(client, "post_day", side_effect=fake_post_day), \
+         patch("mcp_server.service.sync_day_from_fitatu", side_effect=_mock_sync_returning_empty):
         db = MagicMock()
-        db.get.return_value = None  # local cache miss, will trigger client.get_product
+        db.get.return_value = None
         result = service.add_meal_item(
             db, client,
             date="2026-05-22",
-            meal_key="breakfast",
+            meal_key="second_breakfast",
             product_id=555,
             measure_id=1,
-            measure_quantity=1.5,
+            measure_quantity=2.0,
         )
 
     assert result["ok"] is True
     assert result["date"] == "2026-05-22"
-    assert result["meal_key"] == "breakfast"
-    # UUID v1 check
+    assert result["meal_key"] == "second_breakfast"
+    # UUID v1 emitted
     parsed = uuid.UUID(result["plan_day_diet_item_id"])
     assert parsed.version == 1
 
-    # Item shape
-    item = captured["items"][0]
-    assert item["meal"] == "breakfast"
-    assert item["itemId"] == 555
-    assert item["foodType"] == "PRODUCT"
-    assert item["type"] == "PRODUCT"
-    assert item["measureId"] == 1
-    assert item["measureQuantity"] == 1.5
-    assert item["planDayDietItemId"] == result["plan_day_diet_item_id"]
-
-    # Nutrition pro-rated: weight = 100g × 1.5 = 150g; energy = 89 × 150 / 100 = 133.5
-    assert item["weight"] == pytest.approx(150.0)
-    assert item["energy"] == pytest.approx(133.5)
-    assert item["protein"] == pytest.approx(1.65, rel=1e-3)
-    assert item["carbohydrate"] == pytest.approx(34.2, rel=1e-3)
-
-    mock_post.assert_called_once()
-
-
-# -- 9.2 invalid meal_key --
+    # Posted envelope is wrapped { "<date>": {...} } at the client layer; our service
+    # just hands it to post_day. We verify the envelope contents instead.
+    assert posted["date"] == "2026-05-22"
+    env = posted["envelope"]
+    sb_items = env["dietPlan"]["second_breakfast"]["items"]
+    # Existing item preserved
+    assert any(i["planDayDietItemId"] == "old-product-uuid" for i in sb_items)
+    # New item appended with EXACT shape (no nutrition fields)
+    new = next(i for i in sb_items if i["planDayDietItemId"] == result["plan_day_diet_item_id"])
+    assert new["foodType"] == "PRODUCT"
+    assert new["productId"] == 555
+    assert new["measureId"] == 1
+    assert new["measureQuantity"] == 2.0
+    assert new["eaten"] is False
+    assert new["source"] == "API"
+    assert new["ingredientsServing"] is None
+    assert "updatedAt" in new
+    # Nutrition fields MUST NOT leak into the write payload
+    for forbidden in ("energy", "protein", "fat", "carbohydrate", "weight", "meal", "type", "itemId"):
+        assert forbidden not in new, f"unexpected field {forbidden!r} in write payload"
+    # Other meals preserved untouched
+    assert env["dietPlan"]["dinner"]["items"][0]["recipeId"] == 99999
 
 
 def test_add_meal_item_rejects_invalid_meal_key():
     from mcp_server import service
-    from mcp_server.fitatu_client import FitatuClient
 
-    client = FitatuClient("u", "p")
-    client.token = "tok"
-    client.user_id = "42"
-
+    client = _make_client()
     db = MagicMock()
     with pytest.raises(ValueError, match="meal_key"):
         service.add_meal_item(db, client, "2026-05-22", "brunch", 555, 1, 1.0)
 
 
-# -- 9.3 update POST-then-DELETE order --
-
-
-def test_update_meal_item_post_then_delete_order():
-    """update_meal_item issues POST first, then DELETE."""
+def test_add_meal_item_rejects_unknown_measure():
     from mcp_server import service
-    from mcp_server.fitatu_client import FitatuClient
 
-    client = FitatuClient("u", "p")
-    client.token = "tok"
-    client.user_id = "42"
-
-    # Existing day fetch returns one item to replace
-    existing_day = {
-        "dietPlan": {
-            "breakfast": {
-                "items": [
-                    {
-                        "planDayDietItemId": "old-uuid-abc",
-                        "productId": 555,
-                        "measureId": 1,
-                        "measureName": "100g",
-                        "measureQuantity": 1.0,
-                    }
-                ]
-            }
-        }
-    }
-    product = {
-        "id": 555,
-        "name": "Banana",
-        "energy": 89, "protein": 1.1, "fat": 0.3, "carbohydrate": 22.8,
-        "measures": [{"id": 1, "name": "100g", "weightPerUnit": 100.0}],
-    }
-
-    call_log: list[str] = []
-
-    def fake_post(date, items):
-        call_log.append("POST")
-        resp = MagicMock(); resp.status_code = 201; resp.json.return_value = {}
-        return resp
-
-    def fake_delete(date, meal_key, pid, delete_all_related_meals=False):
-        call_log.append("DELETE")
-        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {"deleted": True}
-        return resp
-
-    def fake_sync(db, c, day):
-        from mcp_server.schemas import DaySummarySchema
-        return DaySummarySchema(user_id="42", day_date=day, meals=[])
-
-    with patch.object(client, "get_day", return_value=existing_day), \
-         patch.object(client, "get_product", return_value=product), \
-         patch.object(client, "post_day_items", side_effect=fake_post), \
-         patch.object(client, "delete_day_item", side_effect=fake_delete), \
-         patch("mcp_server.service.sync_day_from_fitatu", side_effect=fake_sync):
+    client = _make_client()
+    with patch.object(client, "get_product", return_value=_make_product(555, measures=[{"id": 1, "name": "100g", "weightPerUnit": 100}])):
         db = MagicMock()
         db.get.return_value = None
+        with pytest.raises(ValueError, match="measure_id 99"):
+            service.add_meal_item(db, client, "2026-05-22", "lunch", 555, 99, 1.0)
+
+
+# ---- 9.2 update: mutates in place, same planDayDietItemId, bumps updatedAt ----
+
+
+def test_update_meal_item_mutates_in_place():
+    from mcp_server import service
+
+    client = _make_client()
+    posted: dict = {}
+
+    def fake_post_day(date, envelope):
+        posted["envelope"] = envelope
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {}
+        return resp
+
+    with patch.object(client, "get_day", return_value=_existing_day_payload()), \
+         patch.object(client, "post_day", side_effect=fake_post_day), \
+         patch("mcp_server.service.sync_day_from_fitatu", side_effect=_mock_sync_returning_empty):
+        db = MagicMock()
         result = service.update_meal_item(
             db, client,
             date="2026-05-22",
-            meal_key="breakfast",
-            plan_day_diet_item_id="old-uuid-abc",
-            new_measure_quantity=2.0,
+            meal_key="second_breakfast",
+            plan_day_diet_item_id="old-product-uuid",
+            new_measure_quantity=42.0,
         )
 
-    assert call_log == ["POST", "DELETE"], f"expected POST then DELETE; got {call_log}"
-    assert result["ok"] is True
-    assert result["replaced_from"] == "old-uuid-abc"
-    assert result["cleanup_failed"] is False
+    # Same UUID
+    assert result["plan_day_diet_item_id"] == "old-product-uuid"
+    items = posted["envelope"]["dietPlan"]["second_breakfast"]["items"]
+    assert len(items) == 1
+    updated = items[0]
+    assert updated["measureQuantity"] == 42.0
+    assert "updatedAt" in updated
+    assert updated["productId"] == 555  # unchanged
 
 
-# -- 9.4 delete URL composition --
-
-
-def test_delete_meal_item_url_composition():
-    """delete_meal_item passes deleteAllRelatedMeals query param correctly."""
+def test_update_meal_item_404_when_id_missing():
     from mcp_server import service
-    from mcp_server.fitatu_client import FitatuClient
 
-    client = FitatuClient("u", "p")
-    client.token = "tok"
-    client.user_id = "42"
+    client = _make_client()
+    with patch.object(client, "get_day", return_value=_existing_day_payload()):
+        db = MagicMock()
+        with pytest.raises(RuntimeError, match="not found"):
+            service.update_meal_item(
+                db, client, "2026-05-22", "second_breakfast", "does-not-exist", 1.0,
+            )
 
-    captured: dict = {}
 
-    def fake_delete(date, meal_key, pid, delete_all_related_meals=False):
-        captured["date"] = date
-        captured["meal_key"] = meal_key
-        captured["pid"] = pid
-        captured["delete_all"] = delete_all_related_meals
-        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {"deleted": True}
+# ---- 9.3 delete: marks deletedAt, item stays in array ----
+
+
+def test_delete_meal_item_marks_deleted_at():
+    from mcp_server import service
+
+    client = _make_client()
+    posted: dict = {}
+
+    def fake_post_day(date, envelope):
+        posted["envelope"] = envelope
+        resp = MagicMock(); resp.status_code = 200; resp.json.return_value = {}
         return resp
 
-    def fake_sync(db, c, day):
-        from mcp_server.schemas import DaySummarySchema
-        return DaySummarySchema(user_id="42", day_date=day, meals=[])
-
-    with patch.object(client, "delete_day_item", side_effect=fake_delete), \
-         patch("mcp_server.service.sync_day_from_fitatu", side_effect=fake_sync):
+    with patch.object(client, "get_day", return_value=_existing_day_payload()), \
+         patch.object(client, "post_day", side_effect=fake_post_day), \
+         patch("mcp_server.service.sync_day_from_fitatu", side_effect=_mock_sync_returning_empty):
         db = MagicMock()
         result = service.delete_meal_item(
-            db, client, "2026-05-22", "breakfast", "uuid-zzz",
-            delete_all_related_meals=True,
+            db, client, "2026-05-22", "second_breakfast", "old-product-uuid",
         )
+
     assert result["ok"] is True
-    assert result["deleted_plan_day_diet_item_id"] == "uuid-zzz"
-    assert captured["delete_all"] is True
+    assert result["deleted_plan_day_diet_item_id"] == "old-product-uuid"
+    items = posted["envelope"]["dietPlan"]["second_breakfast"]["items"]
+    # Item still in array (soft delete) with deletedAt set
+    assert len(items) == 1
+    assert items[0]["planDayDietItemId"] == "old-product-uuid"
+    assert "deletedAt" in items[0]
 
 
-# -- 9.5 delete_meal_item gated by FITATU_ALLOW_DELETE --
+def test_delete_meal_item_idempotent_when_already_deleted():
+    from mcp_server import service
+
+    client = _make_client()
+    day = _existing_day_payload()
+    day["dietPlan"]["second_breakfast"]["items"][0]["deletedAt"] = "2026-05-22 19:00:00"
+
+    with patch.object(client, "get_day", return_value=day), \
+         patch.object(client, "post_day") as mock_post, \
+         patch("mcp_server.service.sync_day_from_fitatu", side_effect=_mock_sync_returning_empty):
+        db = MagicMock()
+        result = service.delete_meal_item(
+            db, client, "2026-05-22", "second_breakfast", "old-product-uuid",
+        )
+    # Idempotent: no POST issued, returns already_deleted flag
+    mock_post.assert_not_called()
+    assert result["already_deleted"] is True
+
+
+# ---- 9.4 tool registrations gated correctly ----
 
 
 def test_delete_meal_item_unregistered_when_flag_false():

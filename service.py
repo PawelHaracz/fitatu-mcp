@@ -434,7 +434,8 @@ def _validate_day_date(day_date: str) -> None:
 def _resolve_product_for_meal_item(db: Session, client: FitatuClient, product_id: int) -> dict:
     """Cache-first product lookup; falls through to client.get_product.
 
-    Returns the full product dict (with measures[]) suitable for meal-item assembly.
+    Returns the full product dict (with measures[]) — used to verify that the
+    chosen measure_id actually exists on the product before we send a write.
     """
     local = get_product_local(db, product_id)
     if local is not None and local.raw:
@@ -452,46 +453,65 @@ def _resolve_product_for_meal_item(db: Session, client: FitatuClient, product_id
     return full
 
 
-def _build_meal_item_payload(client: FitatuClient, product: dict, meal_key: str,
-                              measure_id: int, measure_quantity: float) -> tuple[str, dict]:
-    """Compute meal-item POST body per spec §15.4 with full pro-rated nutrition.
+def _now_updated_at() -> str:
+    """Mirror the format Fitatu's web client uses: 'YYYY-MM-DD H:M:S' (no zero pad)."""
+    from datetime import datetime
+    now = datetime.now()
+    return f"{now.year:04d}-{now.month:02d}-{now.day:02d} {now.hour}:{now.minute}:{now.second}"
 
-    Returns (planDayDietItemId, item_dict).
+
+_WRITE_ITEM_KEYS = (
+    "planDayDietItemId",
+    "foodType",
+    "measureId",
+    "measureQuantity",
+    "ingredientsServing",
+    "mealNumber",
+    "numberOfMeals",
+    "eaten",
+    "productId",
+    "recipeId",
+    "source",
+    "updatedAt",
+    "deletedAt",
+)
+
+
+def _strip_to_write_shape(item: dict) -> dict:
+    """Keep only the fields Fitatu accepts on write; drop computed/server fields."""
+    out: dict = {}
+    for k in _WRITE_ITEM_KEYS:
+        if k in item:
+            out[k] = item[k]
+    return out
+
+
+def _load_day_envelope_for_write(client: FitatuClient, date: str) -> dict:
+    """Fetch current day, strip to write shape per meal/item.
+
+    Returns an envelope ready to be passed to client.post_day(date, envelope).
+    Preserves all existing meals + items (the write endpoint replaces the whole day).
     """
-    measures = product.get("measures") or []
-    measure = next((m for m in measures if m.get("id") == measure_id), None)
-    if measure is None:
-        raise ValueError(
-            f"measure_id {measure_id} not present in product {product.get('id')}.measures[]"
-        )
-
-    weight_per_unit = safe_float(measure.get("weightPerUnit"))
-    total_weight = weight_per_unit * measure_quantity
-
-    def prorate(field: str) -> float:
-        if weight_per_unit <= 0:
-            return 0.0
-        return safe_float(product.get(field)) * total_weight / 100.0
-
-    plan_day_diet_item_id = client._gen_uuid()
-    item = {
-        "planDayDietItemId": plan_day_diet_item_id,
-        "itemId": product["id"],
-        "foodType": "PRODUCT",
-        "type": "PRODUCT",
-        "measureId": measure_id,
-        "measureQuantity": measure_quantity,
-        "meal": meal_key,
-        "weight": total_weight,
-        "energy": prorate("energy"),
-        "protein": prorate("protein"),
-        "fat": prorate("fat"),
-        "carbohydrate": prorate("carbohydrate"),
-        "fiber": prorate("fiber"),
-        "sugars": prorate("sugars"),
-        "salt": prorate("salt"),
+    day_payload = client.get_day(date)
+    diet_plan = (day_payload.get("dietPlan") or {}).copy()
+    new_diet_plan: dict = {}
+    for meal_key, meal in diet_plan.items():
+        items_raw = (meal or {}).get("items") or []
+        new_diet_plan[meal_key] = {"items": [_strip_to_write_shape(i) for i in items_raw]}
+    return {
+        "dietPlan": new_diet_plan,
+        "toiletItems": day_payload.get("toiletItems") or [],
+        "note": day_payload.get("note"),
+        "tagsIds": day_payload.get("tagsIds") or [],
     }
-    return plan_day_diet_item_id, item
+
+
+def _ensure_meal_slot(envelope: dict, meal_key: str) -> list[dict]:
+    """Ensure dietPlan[meal_key] exists; return the items list (mutable)."""
+    diet_plan = envelope.setdefault("dietPlan", {})
+    slot = diet_plan.setdefault(meal_key, {})
+    items = slot.setdefault("items", [])
+    return items
 
 
 def add_meal_item(
@@ -503,19 +523,43 @@ def add_meal_item(
     measure_id: int,
     measure_quantity: float,
 ) -> dict:
-    """Log a meal item: POST one item to {BASE_URL_WRITE}/diet-plan/{userId}/day-items/{date}."""
+    """Append a PRODUCT meal item via the whole-day POST endpoint."""
     _validate_day_date(date)
     _validate_meal_key(meal_key)
     if measure_quantity <= 0:
         raise ValueError(f"measure_quantity must be > 0 (got {measure_quantity})")
 
+    # Verify product + measure are real (catches typos early; not strictly required server-side).
     product = _resolve_product_for_meal_item(db, client, product_id)
-    plan_id, item = _build_meal_item_payload(client, product, meal_key, measure_id, measure_quantity)
+    measures = product.get("measures") or []
+    if not any(m.get("id") == measure_id for m in measures):
+        raise ValueError(
+            f"measure_id {measure_id} not present in product {product_id}.measures[]"
+        )
 
-    response = client.post_day_items(date, [item])
-    if response.status_code not in (200, 201, 204):
+    envelope = _load_day_envelope_for_write(client, date)
+    items = _ensure_meal_slot(envelope, meal_key)
+
+    plan_id = client._gen_uuid()
+    new_item = {
+        "planDayDietItemId": plan_id,
+        "foodType": "PRODUCT",
+        "measureId": measure_id,
+        "measureQuantity": measure_quantity,
+        "ingredientsServing": None,
+        "mealNumber": None,
+        "numberOfMeals": None,
+        "eaten": False,
+        "productId": product_id,
+        "source": "API",
+        "updatedAt": _now_updated_at(),
+    }
+    items.append(new_item)
+
+    response = client.post_day(date, envelope)
+    if response.status_code not in (200, 201, 202, 204):
         raise RuntimeError(
-            f"post_day_items failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
+            f"post_day failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
         )
 
     day_summary = sync_day_from_fitatu(db, client, date)
@@ -536,61 +580,42 @@ def update_meal_item(
     plan_day_diet_item_id: str,
     new_measure_quantity: float,
 ) -> dict:
-    """Replace = POST new item, then DELETE old. Per spec §15.1 C3 patch."""
+    """Update an item's measure_quantity in place; same planDayDietItemId."""
     _validate_day_date(date)
     _validate_meal_key(meal_key)
     if new_measure_quantity <= 0:
         raise ValueError(f"new_measure_quantity must be > 0 (got {new_measure_quantity})")
 
-    day_payload = client.get_day(date)
-    meal = (day_payload.get("dietPlan") or {}).get(meal_key) or {}
-    items = meal.get("items") or []
+    envelope = _load_day_envelope_for_write(client, date)
+    items = _ensure_meal_slot(envelope, meal_key)
     existing = next((i for i in items if str(i.get("planDayDietItemId")) == str(plan_day_diet_item_id)), None)
     if existing is None:
         raise RuntimeError(
             f"plan_day_diet_item_id {plan_day_diet_item_id!r} not found in {meal_key} of {date}"
         )
-
-    product_id = existing.get("productId")
-    measure_id = existing.get("measureId")
-    if product_id is None or measure_id is None:
+    if existing.get("deletedAt"):
         raise RuntimeError(
-            f"existing item missing productId/measureId; cannot rebuild for update"
+            f"plan_day_diet_item_id {plan_day_diet_item_id!r} is soft-deleted; cannot update"
         )
 
-    product = _resolve_product_for_meal_item(db, client, int(product_id))
-    new_plan_id, new_item = _build_meal_item_payload(
-        client, product, meal_key, int(measure_id), new_measure_quantity
-    )
+    existing["measureQuantity"] = new_measure_quantity
+    existing["updatedAt"] = _now_updated_at()
+    # If the item is a RECIPE with ingredientsServing, scale it (mirror web client: portions × qty).
+    # We don't have access to recipe portions here without an extra fetch, so leave
+    # ingredientsServing untouched for v1 — server keeps the old number-of-portions allocation.
 
-    post_resp = client.post_day_items(date, [new_item])
-    if post_resp.status_code not in (200, 201, 204):
+    response = client.post_day(date, envelope)
+    if response.status_code not in (200, 201, 202, 204):
         raise RuntimeError(
-            f"update_meal_item POST failed: {post_resp.status_code} {getattr(post_resp, 'text', '')[:200]}"
-        )
-
-    cleanup_failed = False
-    warnings: list[str] = []
-    del_resp = client.delete_day_item(date, meal_key, plan_day_diet_item_id)
-    if del_resp.status_code not in (200, 204):
-        cleanup_failed = True
-        warnings.append(
-            f"old item {plan_day_diet_item_id} must be deleted manually via delete_meal_item"
-        )
-        logger.warning(
-            "update_meal_item cleanup DELETE failed status=%s pid=%s",
-            del_resp.status_code, plan_day_diet_item_id,
+            f"post_day (update) failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
         )
 
     day_summary = sync_day_from_fitatu(db, client, date)
     return {
         "ok": True,
-        "plan_day_diet_item_id": new_plan_id,
-        "replaced_from": plan_day_diet_item_id,
+        "plan_day_diet_item_id": plan_day_diet_item_id,
         "date": date,
         "meal_key": meal_key,
-        "cleanup_failed": cleanup_failed,
-        "warnings": warnings,
         "day": day_summary.model_dump(mode="json") if hasattr(day_summary, "model_dump") else day_summary,
     }
 
@@ -603,15 +628,40 @@ def delete_meal_item(
     plan_day_diet_item_id: str,
     delete_all_related_meals: bool = False,
 ) -> dict:
+    """Soft-delete: mark `deletedAt` on the item and POST the whole day.
+
+    `delete_all_related_meals` is accepted for API parity but has no equivalent
+    in the whole-day-POST contract; the param is ignored (single-item soft-delete).
+    """
     _validate_day_date(date)
     _validate_meal_key(meal_key)
 
-    response = client.delete_day_item(
-        date, meal_key, plan_day_diet_item_id, delete_all_related_meals=delete_all_related_meals,
-    )
-    if response.status_code not in (200, 204):
+    envelope = _load_day_envelope_for_write(client, date)
+    items = _ensure_meal_slot(envelope, meal_key)
+    existing = next((i for i in items if str(i.get("planDayDietItemId")) == str(plan_day_diet_item_id)), None)
+    if existing is None:
         raise RuntimeError(
-            f"delete_meal_item failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
+            f"plan_day_diet_item_id {plan_day_diet_item_id!r} not found in {meal_key} of {date}"
+        )
+    if existing.get("deletedAt"):
+        # Already deleted — idempotent no-op
+        return {
+            "ok": True,
+            "deleted_plan_day_diet_item_id": plan_day_diet_item_id,
+            "date": date,
+            "meal_key": meal_key,
+            "already_deleted": True,
+        }
+
+    # Format matches web client capture: "YYYY-MM-DD HH:MM:SS" (zero-padded here; server tolerates either).
+    from datetime import datetime
+    now = datetime.now()
+    existing["deletedAt"] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    response = client.post_day(date, envelope)
+    if response.status_code not in (200, 201, 202, 204):
+        raise RuntimeError(
+            f"post_day (delete) failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
         )
 
     day_summary = sync_day_from_fitatu(db, client, date)

@@ -249,7 +249,19 @@ class FitatuClient:
         """
         return None
 
-    # -- Day-item writes (write-cluster; www.fitatu.com/api) --
+    # -- Day-write API (confirmed via browser capture 2026-05-22) --
+    #
+    # The Fitatu web client persists day mutations through a single
+    # "whole-day POST" endpoint:
+    #
+    #   POST /api/diet-plan/{userId}/days
+    #   Body: { "<YYYY-MM-DD>": { "dietPlan": {...}, "toiletItems": [], "note": null, "tagsIds": [] } }
+    #
+    # Add/update/delete are all modeled as mutations of the in-memory day
+    # envelope (delete = mark `deletedAt`, update = mutate `measureQuantity`
+    # + bump `updatedAt`, add = append). The server is the source of truth
+    # for nutrition computation — clients send only product/recipe IDs +
+    # measure + quantity, NOT pro-rated nutrition.
 
     def search_food(
         self,
@@ -258,7 +270,7 @@ class FitatuClient:
         limit: int = 40,
         access_types: list[str] | None = None,
     ) -> list[dict]:
-        """GET {BASE_URL_WRITE}/search/food/user/{userId} for product search."""
+        """GET /api/search/food/user/{userId} (on the read cluster)."""
         types = access_types or ["FREE"]
         params: dict[str, Any] = {
             "phrase": phrase,
@@ -268,32 +280,22 @@ class FitatuClient:
         }
         response = self._request(
             "GET",
-            f"/search/food/user/{self.user_id}",
+            f"/api/search/food/user/{self.user_id}",
             params=params,
-            base_url=self.base_url_write,
         )
         if response.status_code != 200:
             raise RuntimeError(f"search_food failed: {response.status_code} {response.text[:200]}")
         return response.json()
 
-    def post_day_items(self, date: str, items: list[dict]) -> "requests.Response":
+    def post_day(self, date: str, day_envelope: dict) -> "requests.Response":
+        """POST a whole-day replace to /api/diet-plan/{userId}/days.
+
+        `day_envelope` is the inner value (matching what GET /diet-and-activity-plan
+        returns for a single day) and will be wrapped as `{date: day_envelope}`.
+        """
+        body = {date: day_envelope}
         return self._request(
             "POST",
-            f"/diet-plan/{self.user_id}/day-items/{date}",
-            json={"items": items},
-            base_url=self.base_url_write,
-        )
-
-    def delete_day_item(
-        self,
-        date: str,
-        meal_key: str,
-        plan_day_diet_item_id: str,
-        delete_all_related_meals: bool = False,
-    ) -> "requests.Response":
-        return self._request(
-            "DELETE",
-            f"/diet-plan/{self.user_id}/day/{date}/{meal_key}/{plan_day_diet_item_id}",
-            params={"deleteAllRelatedMeals": str(delete_all_related_meals).lower()},
-            base_url=self.base_url_write,
+            f"/api/diet-plan/{self.user_id}/days",
+            json=body,
         )

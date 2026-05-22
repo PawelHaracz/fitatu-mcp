@@ -527,21 +527,19 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         @mcp.tool(
             name="delete_meal_item",
             description=(
-                "Remove a logged meal item. Requires FITATU_ALLOW_DELETE=true. "
-                "Pass delete_all_related_meals=true ONLY if the user explicitly wants to remove all "
-                "instances of this item across the week (server-side feature)."
+                "Soft-delete a logged meal item (marks deletedAt server-side). "
+                "Requires FITATU_ALLOW_DELETE=true."
             ),
         )
         def mcp_delete_meal_item(
             date: str,
             meal_key: str,
             plan_day_diet_item_id: str,
-            delete_all_related_meals: bool = False,
         ) -> dict:
             _ensure_user_id()
             with SessionLocal() as db:
                 result = service.delete_meal_item(
-                    db, client, date, meal_key, plan_day_diet_item_id, delete_all_related_meals,
+                    db, client, date, meal_key, plan_day_diet_item_id,
                 )
                 db.commit()
                 return result

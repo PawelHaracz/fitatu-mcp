@@ -207,8 +207,8 @@ def test_delete_product_issues_delete_and_returns_body():
 
 
 def test_search_food_get_request_shape():
-    """search_food hits BASE_URL_WRITE/search/food/user/{uid} with query params."""
-    from mcp_server.fitatu_client import BASE_URL_WRITE
+    """search_food hits {BASE_URL_READ}/api/search/food/user/{uid} with query params."""
+    from mcp_server.fitatu_client import BASE_URL_READ
 
     client = _ready_client()
     with patch("mcp_server.fitatu_client.requests.request") as mock_req:
@@ -221,8 +221,26 @@ def test_search_food_get_request_shape():
         url = call.args[1] if len(call.args) > 1 else call.kwargs.get("url")
         params = call.kwargs.get("params") or {}
         assert method == "GET"
-        assert url == f"{BASE_URL_WRITE}/search/food/user/42"
+        assert url == f"{BASE_URL_READ}/api/search/food/user/42"
         assert params["phrase"] == "apple"
         assert params["page"] == 1
         assert params["limit"] == 10
         assert "accessType[]" in params or "accessType" in params
+
+
+def test_post_day_wraps_body_with_date_key():
+    """post_day posts to /api/diet-plan/{uid}/days with body = {date: envelope}."""
+    client = _ready_client()
+    envelope = {"dietPlan": {"breakfast": {"items": []}}, "toiletItems": [], "note": None, "tagsIds": []}
+    with patch("mcp_server.fitatu_client.requests.request") as mock_req:
+        mock_req.return_value = _mock_response(200, {})
+        client.post_day("2026-05-22", envelope)
+
+        call = mock_req.call_args
+        method = call.args[0] if call.args else call.kwargs.get("method")
+        url = call.args[1] if len(call.args) > 1 else call.kwargs.get("url")
+        body = call.kwargs.get("json")
+        assert method == "POST"
+        assert url.endswith("/api/diet-plan/42/days")
+        assert list(body.keys()) == ["2026-05-22"]
+        assert body["2026-05-22"]["dietPlan"]["breakfast"]["items"] == []
