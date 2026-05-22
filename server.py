@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import re
@@ -425,19 +426,45 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         name="search_products",
         description=(
             "Search products. scope='custom' = local LIKE over cached/created products. "
-            "scope='catalog' = live Fitatu search (PRODUCT + RECIPE), via "
-            "GET /api/search/food/user/{uid}. scope='all' = custom first, then catalog "
-            "with custom rows de-duplicated by product id."
+            "scope='catalog' = live Fitatu search via GET /api/search/new/food (the endpoint the "
+            "Fitatu web app uses). scope='all' = custom first, then catalog (dedup by id). "
+            "type_filter: 'PRODUCT' (default) | 'RECIPE' | 'ANY'. "
+            "Optional macro filters (per 100g) — pass -1 (sentinel for 'unset'): "
+            "min_energy/max_energy/min_protein/max_protein/min_fat/max_fat/min_carbohydrate/max_carbohydrate. "
+            "Any active macro filter sets hasFilters=true upstream. "
+            "Results include `score` (0..5, higher = better name match) and `index` "
+            "('SEARCH' = name match, 'LAST_USED' = your history). Short distinctive phrases "
+            "(brand or product name) work best."
         ),
     )
-    def mcp_search_products(query: str, scope: str = "custom", limit: int = 20) -> dict:
+    def mcp_search_products(
+        query: str,
+        scope: str = "custom",
+        limit: int = 20,
+        type_filter: str = "PRODUCT",
+        min_energy: float = -1,
+        max_energy: float = -1,
+        min_protein: float = -1,
+        max_protein: float = -1,
+        min_fat: float = -1,
+        max_fat: float = -1,
+        min_carbohydrate: float = -1,
+        max_carbohydrate: float = -1,
+    ) -> dict:
         q = (query or "").strip()
+        type_filter_u = (type_filter or "PRODUCT").upper().strip()
+
         if len(q) < 2:
             raise ValueError("query must be at least 2 characters")
         if scope not in {"custom", "catalog", "all"}:
             raise ValueError("scope must be one of custom|catalog|all")
         if not 1 <= limit <= 50:
             raise ValueError("limit must be between 1 and 50")
+        if type_filter_u not in {"PRODUCT", "RECIPE", "ANY"}:
+            raise ValueError("type_filter must be PRODUCT|RECIPE|ANY")
+
+        def _macro(value: float) -> float | None:
+            return None if value == -1 else value
 
         custom_results: list[dict] = []
         if scope in {"custom", "all"}:
@@ -451,32 +478,59 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
                         "energy": r.energy,
                         "source": r.source,
                         "type": "PRODUCT",
+                        "score": None,
+                        "index": None,
                     }
                     for r in rows
                 ]
 
         catalog_results: list[dict] = []
+        warnings: list[str] = []
         if scope in {"catalog", "all"}:
             _ensure_user_id()
             try:
-                hits = client.search_food(q, page=1, limit=limit)
+                hits = client.search_food(
+                    phrase=q,
+                    page=1,
+                    limit=max(limit * 2, 40),
+                    min_energy=_macro(min_energy),
+                    max_energy=_macro(max_energy),
+                    min_protein=_macro(min_protein),
+                    max_protein=_macro(max_protein),
+                    min_fat=_macro(min_fat),
+                    max_fat=_macro(max_fat),
+                    min_carbohydrate=_macro(min_carbohydrate),
+                    max_carbohydrate=_macro(max_carbohydrate),
+                )
             except RuntimeError as exc:
                 logger.warning("search_food upstream failed: %s", exc)
                 hits = []
+                warnings.append(f"upstream catalog search failed: {exc}")
+
             seen_ids = {r["id"] for r in custom_results}
+            kept = []
             for hit in hits:
                 fid = hit.get("foodId")
                 if fid is None or fid in seen_ids:
                     continue
-                catalog_results.append({
+                hit_type = (hit.get("type") or "").upper()
+                if type_filter_u != "ANY" and hit_type != type_filter_u:
+                    continue
+                kept.append({
                     "id": fid,
                     "name": hit.get("name"),
                     "brand": hit.get("brand") or None,
+                    "manufacturer": hit.get("manufacturer") or None,
                     "energy": hit.get("energy"),
                     "source": "catalog",
-                    "type": (hit.get("type") or "").upper() or None,
+                    "type": hit_type or None,
+                    "score": hit.get("score"),
+                    "index": hit.get("index"),
+                    "verified": bool(hit.get("verified")),
                 })
                 seen_ids.add(fid)
+            # Preserve upstream order (Fitatu already ranks SEARCH-hit brand products well).
+            catalog_results = kept
 
         if scope == "custom":
             results = custom_results
@@ -485,7 +539,21 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         else:
             results = (custom_results + catalog_results)[:limit]
 
-        return {"ok": True, "query": q, "scope": scope, "results": results}
+        envelope: dict = {
+            "ok": True,
+            "query": q,
+            "scope": scope,
+            "type_filter": type_filter_u,
+            "results": results,
+        }
+        if warnings:
+            envelope["warnings"] = warnings
+        if not results and scope in {"catalog", "all"}:
+            envelope["hint"] = (
+                "No catalog matches. Try a shorter, more distinctive phrase (a brand or core word), "
+                "or use create_custom_product with values from the package label."
+            )
+        return envelope
 
     # -- Meal-item write tools (Group 9, spec §15 — PRIMARY user goal) --
 
@@ -536,6 +604,103 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
             )
             db.commit()
             return result
+
+    # -- Recipes --
+
+    @mcp.tool(
+        name="get_recipe_tags",
+        description=(
+            "List the recipe tags Fitatu supports (cuisines, diet types, popular categories, "
+            "meal characters). Each entry is {name, category, translation}. Pass full entries "
+            "back to create_recipe via the `tags` argument."
+        ),
+    )
+    def mcp_get_recipe_tags() -> dict:
+        _ensure_user_id()
+        tags = client.get_recipe_tags()
+        return {"ok": True, "count": len(tags), "tags": tags}
+
+    @mcp.tool(
+        name="create_recipe",
+        description=(
+            "Create a user recipe in the Fitatu catalog. items_json is a JSON-encoded list of "
+            "{type:'PRODUCT'|'RECIPE', itemId:int, measureId:int, measureQuantity:float}. "
+            "meal_schema_csv is a comma-separated subset of "
+            "breakfast/second_breakfast/lunch/dinner/snack/supper (empty = all). "
+            "tags_json is an optional JSON array of full tag dicts from get_recipe_tags "
+            "(plus optional user tags as {name, category:'RECIPE_TAG_USERS_TYPE', translation}). "
+            "Server returns id + computed macros (energy/protein/fat/carbohydrate per serving)."
+        ),
+    )
+    def mcp_create_recipe(
+        name: str,
+        items_json: str,
+        serving: str = "1",
+        cooking_time: int = 0,
+        preparation_time: str = "",
+        recipe_description: str = "",
+        meal_schema_csv: str = "",
+        tags_json: str = "",
+        shared: bool = False,
+    ) -> dict:
+        name_clean = (name or "").strip()
+        if not name_clean:
+            raise ValueError("name must be non-empty")
+        if len(name_clean) > 200:
+            raise ValueError("name must be 200 characters or fewer")
+
+        try:
+            items = json.loads(items_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"items_json must be valid JSON: {exc}") from exc
+        if not isinstance(items, list) or not items:
+            raise ValueError("items_json must be a non-empty JSON array")
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                raise ValueError(f"items_json[{i}] must be an object")
+            it_type = (it.get("type") or "").upper()
+            if it_type not in {"PRODUCT", "RECIPE"}:
+                raise ValueError(f"items_json[{i}].type must be PRODUCT or RECIPE (got {it_type!r})")
+            for k in ("itemId", "measureId", "measureQuantity"):
+                if k not in it:
+                    raise ValueError(f"items_json[{i}] missing required key {k!r}")
+            it["type"] = it_type
+
+        valid_keys = service.MEAL_KEYS_VALID
+        meal_schema = [k.strip() for k in meal_schema_csv.split(",") if k.strip()] if meal_schema_csv else list(valid_keys)
+        for mk in meal_schema:
+            if mk not in valid_keys:
+                raise ValueError(f"meal_schema_csv contains invalid key {mk!r}; valid: {sorted(valid_keys)}")
+
+        tags: list[dict] = []
+        if tags_json:
+            try:
+                tags = json.loads(tags_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"tags_json must be valid JSON: {exc}") from exc
+            if not isinstance(tags, list):
+                raise ValueError("tags_json must be a JSON array of tag objects")
+            for i, t in enumerate(tags):
+                if not isinstance(t, dict) or not {"name", "category"}.issubset(t):
+                    raise ValueError(f"tags_json[{i}] must include 'name' and 'category'")
+                t.setdefault("translation", t["name"])
+
+        payload: dict = {
+            "categories": None,
+            "cookingTime": cooking_time,
+            "items": items,
+            "mealSchema": meal_schema,
+            "name": name_clean,
+            "preparationTime": preparation_time,
+            "recipeDescription": recipe_description,
+            "serving": str(serving),
+            "shared": bool(shared),
+            "tags": tags,
+        }
+
+        _ensure_user_id()
+        created = client.create_recipe(payload)
+        return {"ok": True, "recipe": created}
 
     if allow_delete:
         @mcp.tool(

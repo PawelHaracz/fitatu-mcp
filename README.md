@@ -45,6 +45,13 @@ All date params are `YYYY-MM-DD`. Read tools accept a `start_date` and optional 
 | `search_products(query, scope="custom", limit=20)` | Search by name. `scope="custom"` = local LIKE over cached/custom products. `scope="catalog"` = live Fitatu search (PRODUCT + RECIPE hits via `GET /api/search/food/user/{uid}`). `scope="all"` = custom first, then catalog, deduplicated by product id. |
 | `delete_custom_product(product_id)` | Remove a user-owned product from both Fitatu and the local cache. **Gated by `FITATU_ALLOW_DELETE=true`**. |
 
+### Write tools — recipes
+
+| Tool | Description |
+|------|-------------|
+| `get_recipe_tags()` | List recipe tags Fitatu supports (cuisines, diet types, popular categories, meal characters). Pass entries verbatim into `create_recipe`. |
+| `create_recipe(name, items_json, ...)` | Create a user recipe. `items_json` = list of `{type:'PRODUCT'\|'RECIPE', itemId, measureId, measureQuantity}`. Optional `serving`, `cooking_time`, `preparation_time`, `recipe_description`, `meal_schema_csv`, `tags_json`, `shared`. Server returns `{id, name, energy, protein, fat, carbohydrate}` (per serving). |
+
 Writes hit `https://www.fitatu.com/api` (the canonical web app cluster). Reads still go to `https://pl-pl.fitatu.com`. Both can be overridden with `FITATU_BASE_URL_READ` / `FITATU_BASE_URL_WRITE`.
 
 ## Quick start (docker compose)

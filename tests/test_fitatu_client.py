@@ -207,7 +207,7 @@ def test_delete_product_issues_delete_and_returns_body():
 
 
 def test_search_food_get_request_shape():
-    """search_food hits {BASE_URL_READ}/api/search/food/user/{uid} with query params."""
+    """search_food hits {BASE_URL_READ}/api/search/new/food with query params (web-app endpoint)."""
     from mcp_server.fitatu_client import BASE_URL_READ
 
     client = _ready_client()
@@ -221,11 +221,30 @@ def test_search_food_get_request_shape():
         url = call.args[1] if len(call.args) > 1 else call.kwargs.get("url")
         params = call.kwargs.get("params") or {}
         assert method == "GET"
-        assert url == f"{BASE_URL_READ}/api/search/food/user/42"
+        assert url == f"{BASE_URL_READ}/api/search/new/food"
         assert params["phrase"] == "apple"
         assert params["page"] == 1
         assert params["limit"] == 10
-        assert "accessType[]" in params or "accessType" in params
+        assert params["hasFilters"] == "false"
+        assert params["locale"] == "pl_PL"
+        assert "accessType[]" in params
+        assert "FREE" in params["accessType[]"] and "PREMIUM" in params["accessType[]"]
+
+
+def test_search_food_macro_filters_set_has_filters_true():
+    from mcp_server.fitatu_client import BASE_URL_READ
+
+    client = _ready_client()
+    with patch("mcp_server.fitatu_client.requests.request") as mock_req:
+        mock_req.return_value = _mock_response(200, [])
+        client.search_food("apple", min_energy=50, max_energy=200, min_protein=5)
+        params = mock_req.call_args.kwargs["params"]
+        assert params["hasFilters"] == "true"
+        assert params["minEnergy"] == 50
+        assert params["maxEnergy"] == 200
+        assert params["minProtein"] == 5
+        assert "maxProtein" not in params
+        assert "minFat" not in params
 
 
 def test_post_day_wraps_body_with_date_key():

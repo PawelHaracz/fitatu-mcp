@@ -250,6 +250,37 @@ class FitatuClient:
         """
         return None
 
+    # -- Recipes --
+
+    def get_recipe_tags(self) -> list[dict]:
+        """GET /api/resources/food-tags/recipe — list of available recipe tags.
+
+        Each tag carries {name, translation, category}. `name` is the tag id (e.g.
+        `tag.vegan`), `category` is a `RECIPE_TAG_CATEGORY_*` enum. Pass the whole
+        tag dict back when creating a recipe.
+        """
+        response = self._request("GET", "/api/resources/food-tags/recipe")
+        if response.status_code != 200:
+            raise RuntimeError(f"get_recipe_tags failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    def create_recipe(self, payload: dict) -> dict[str, Any]:
+        """POST /api/recipes — create a user recipe.
+
+        Payload keys (per browser capture 2026-05-22):
+          - name (str), serving (str), cookingTime (int), preparationTime (str)
+          - recipeDescription (str), shared (bool), categories (list|null)
+          - mealSchema (list[str]): subset of breakfast/second_breakfast/lunch/dinner/snack/supper
+          - items (list): [{type:"PRODUCT"|"RECIPE", itemId:int, measureId:int, measureQuantity:float}]
+          - tags (list): list of full tag dicts (name/category/translation), incl. RECIPE_TAG_USERS_TYPE entries
+
+        Response: {id, name, energy, fat, protein, carbohydrate} — server computes nutrition.
+        """
+        response = self._request("POST", "/api/recipes", json=payload)
+        if response.status_code not in (200, 201):
+            raise RuntimeError(f"create_recipe failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
     # -- Day-write API (confirmed via browser capture 2026-05-22) --
     #
     # The Fitatu web client persists day mutations through a single
@@ -270,20 +301,54 @@ class FitatuClient:
         page: int = 1,
         limit: int = 40,
         access_types: list[str] | None = None,
+        date: str | None = None,
+        meal: str | None = None,
+        locale: str = "pl_PL",
+        min_energy: float | None = None,
+        max_energy: float | None = None,
+        min_protein: float | None = None,
+        max_protein: float | None = None,
+        min_fat: float | None = None,
+        max_fat: float | None = None,
+        min_carbohydrate: float | None = None,
+        max_carbohydrate: float | None = None,
     ) -> list[dict]:
-        """GET /api/search/food/user/{userId} (on the read cluster)."""
-        types = access_types or ["FREE"]
+        """GET /api/search/new/food (on the read cluster) — the endpoint the Fitatu web app
+        actually uses (confirmed by browser capture 2026-05-22).
+
+        Each hit carries:
+          - `index`: `SEARCH` (name-match) or `LAST_USED` (your history)
+          - `score`: relevance (0..5; brand store hits often 5.0, generics 0.0)
+        Optional macro filters (per 100g/100ml) narrow results server-side; passing any
+        of them automatically sets `hasFilters=true`.
+        """
+        types = access_types or ["FREE", "PREMIUM"]
+        macro_filters = {
+            "minEnergy": min_energy,
+            "maxEnergy": max_energy,
+            "minProtein": min_protein,
+            "maxProtein": max_protein,
+            "minFat": min_fat,
+            "maxFat": max_fat,
+            "minCarbohydrate": min_carbohydrate,
+            "maxCarbohydrate": max_carbohydrate,
+        }
+        active_macros = {k: v for k, v in macro_filters.items() if v is not None}
+        has_filters = bool(active_macros)
         params: dict[str, Any] = {
             "phrase": phrase,
             "page": page,
             "limit": limit,
             "accessType[]": types,
+            "hasFilters": "true" if has_filters else "false",
+            "locale": locale,
+            **active_macros,
         }
-        response = self._request(
-            "GET",
-            f"/api/search/food/user/{self.user_id}",
-            params=params,
-        )
+        if date:
+            params["date"] = date
+        if meal:
+            params["meal"] = meal
+        response = self._request("GET", "/api/search/new/food", params=params)
         if response.status_code != 200:
             raise RuntimeError(f"search_food failed: {response.status_code} {response.text[:200]}")
         return response.json()
