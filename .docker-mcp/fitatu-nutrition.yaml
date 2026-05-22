@@ -1,0 +1,21 @@
+name: fitatu-nutrition
+type: remote
+image: ""
+description: Daily nutrition (meals + macros) from Fitatu, cached in local SQLite.
+title: Fitatu Nutrition
+remote:
+  url: http://host.docker.internal:8000/mcp/
+  transport_type: streamable-http
+  headers:
+    Authorization: Bearer ${FITATU_MCP_API_KEY}
+secrets:
+  - name: fitatu.api_key
+    env: FITATU_MCP_API_KEY
+metadata:
+  category: health
+  tags:
+    - nutrition
+    - fitatu
+    - remote
+  license: Private
+  owner: local

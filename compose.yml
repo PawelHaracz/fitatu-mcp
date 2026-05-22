@@ -1,0 +1,47 @@
+# fitatu-mcp + n8n
+#
+# Usage:
+#   1) cp .env.example .env && edit credentials
+#   2) docker compose up -d --build
+#   3) Open n8n at http://localhost:5678 and finish owner setup
+#   4) In n8n add an "MCP" credential / node pointing at:
+#        URL:    http://fitatu-mcp:8000/mcp/
+#        Header: Authorization: Bearer ${MCP_API_KEY}
+#
+# Pull the published image instead of building locally:
+#   docker compose pull && docker compose up -d
+# Override the published image tag with FITATU_MCP_IMAGE in your .env.
+
+services:
+  fitatu-mcp:
+    image: ${FITATU_MCP_IMAGE:-ghcr.io/pawelharacz/fitatu-mcp:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fitatu-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=${GENERIC_TIMEZONE:-Europe/Warsaw}
+    volumes:
+      - fitatu_data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # Expose to host only if you also want to call it from outside the compose
+    # network (e.g. local Claude Desktop). Comment out otherwise — n8n reaches
+    # it on the internal network as http://fitatu-mcp:8000.
+    ports:
+      - "${FITATU_MCP_PORT:-8000}:8000"
+
+volumes:
+  fitatu_data:
+

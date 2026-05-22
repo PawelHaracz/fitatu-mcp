@@ -4,3 +4,10 @@ __pycache__/
 *.pyd
 *.db
 .env
+.claude/settings.local.json
+.playwright/
+.vscode/
+.idea/
+.DS_Store
+logs/
+.playwright-mcp/
