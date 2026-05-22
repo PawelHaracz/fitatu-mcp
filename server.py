@@ -3,6 +3,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from typing import Mapping
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -13,6 +14,7 @@ from .database import SessionLocal, init_db
 from .fitatu_client import FitatuClient
 from .models import DailyNutrition, MealNutrition
 from .schemas import MacroTotals
+from . import service
 from .service import db_day_to_schema, sync_day_from_fitatu
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -21,76 +23,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-FITATU_USERNAME = os.getenv("FITATU_USERNAME")
-FITATU_PASSWORD = os.getenv("FITATU_PASSWORD")
-MCP_API_KEY = os.getenv("MCP_API_KEY")
-MCP_ENABLE_DNS_REBINDING_PROTECTION = os.getenv("MCP_ENABLE_DNS_REBINDING_PROTECTION", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-MCP_ALLOWED_HOSTS = os.getenv(
-    "MCP_ALLOWED_HOSTS",
-    "localhost,localhost:*,127.0.0.1,127.0.0.1:*,fitatu-mcp,fitatu-mcp:*,host.docker.internal,host.docker.internal:*",
-)
-
-if not FITATU_USERNAME or not FITATU_PASSWORD:
-    raise RuntimeError("FITATU_USERNAME and FITATU_PASSWORD must be set")
-if not MCP_API_KEY:
-    raise RuntimeError("MCP_API_KEY must be set")
-
-TODAY_TTL_SECONDS = int(os.getenv("FITATU_TODAY_TTL_SECONDS", "300"))
-
-client = FitatuClient(FITATU_USERNAME, FITATU_PASSWORD)
-
-transport_security = TransportSecuritySettings(
-    enable_dns_rebinding_protection=MCP_ENABLE_DNS_REBINDING_PROTECTION,
-    allowed_hosts=[h.strip() for h in MCP_ALLOWED_HOSTS.split(",") if h.strip()],
-)
-
-mcp = FastMCP(
-    name="fitatu-nutrition-mcp",
-    instructions=(
-        "Use tools to sync and read daily nutrition, macros, and meals from Fitatu-backed SQLite storage."
-    ),
-    streamable_http_path="/",
-    transport_security=transport_security,
-)
-
-mcp_app = mcp.streamable_http_app()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Server startup: initializing DB and MCP session manager")
-    init_db()
-    async with mcp.session_manager.run():
-        yield
-
-
-app = FastAPI(
-    title="Fitatu Nutrition MCP Server",
-    version="1.0.0",
-    description="MCP server exposing daily meals and macro nutrient information",
-    lifespan=lifespan,
-)
-
-
-@app.middleware("http")
-async def bearer_auth(request: Request, call_next):
-    if request.url.path.startswith("/mcp"):
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != MCP_API_KEY:
-            logger.warning(
-                "Unauthorized MCP request path=%s client=%s auth_prefix=%s",
-                request.url.path,
-                request.client.host if request.client else "unknown",
-                auth[:16],
-            )
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    return await call_next(request)
 
 
 _DATE_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
@@ -139,14 +71,6 @@ def _range_envelope(start_date: str, end_date: str, days: list) -> dict:
     }
 
 
-def _ensure_user_id() -> str:
-    if not client.user_id:
-        client.login()
-    if not client.user_id:
-        raise ValueError("Could not determine user_id after login")
-    return client.user_id
-
-
 def _load_day(db: Session, user_id: str, day_date: str) -> DailyNutrition | None:
     return (
         db.query(DailyNutrition)
@@ -163,215 +87,506 @@ def _cache_counts(db: Session, user_id: str, day_date: str) -> tuple[int, int]:
         .filter(DailyNutrition.user_id == user_id, DailyNutrition.day_date == day_date)
         .one_or_none()
     )
-
     if not day_row:
         return 0, 0
-
     meals_count = len(day_row.meals)
     items_count = sum(len(meal.items) for meal in day_row.meals)
     return meals_count, items_count
 
 
-def _load_or_sync_day(db: Session, user_id: str, day_date: str) -> DailyNutrition:
-    day_row = _load_day(db, user_id, day_date)
-
-    if day_row and not _is_today_stale(day_row, day_date):
-        return day_row
-
-    if day_row:
-        logger.info("Stale today cache for day_date=%s user_id=%s; triggering re-sync", day_date, user_id)
-    else:
-        logger.info("Cache miss for day_date=%s user_id=%s; triggering auto-sync", day_date, user_id)
-
-    summary = sync_day_from_fitatu(db, client, day_date)
-    day_row = _load_day(db, summary.user_id, day_date)
-    if not day_row:
-        raise ValueError("Day data not found after auto-sync. Check Fitatu source data.")
-    return day_row
-
-
-def _is_today_stale(day_row: DailyNutrition, day_date: str) -> bool:
+def _is_today_stale(day_row: DailyNutrition, day_date: str, today_ttl_seconds: int) -> bool:
     if day_date != date.today().isoformat():
         return False
     if day_row.updated_at is None:
         return True
     age_seconds = (datetime.now(timezone.utc) - day_row.updated_at.replace(tzinfo=timezone.utc)).total_seconds()
-    return age_seconds > TODAY_TTL_SECONDS
+    return age_seconds > today_ttl_seconds
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
+    """Construct (FastAPI, FastMCP) pair from env mapping.
 
+    Env keys consumed:
+      - FITATU_USERNAME, FITATU_PASSWORD, FITATU_API_SECRET, MCP_API_KEY (required)
+      - FITATU_BASE_URL_READ, FITATU_BASE_URL_WRITE (optional client overrides)
+      - FITATU_ALLOW_DELETE (default false; gates destructive tools)
+      - FITATU_TODAY_TTL_SECONDS, MCP_ENABLE_DNS_REBINDING_PROTECTION, MCP_ALLOWED_HOSTS (server config)
+    """
+    env = env if env is not None else os.environ
 
-@mcp.tool(
-    name="sync_day",
-    description=(
-        "Sync daily nutrition from Fitatu into SQLite for a date range. "
-        "start_date is required (YYYY-MM-DD). end_date defaults to start_date. "
-        "Maximum range: 31 days."
-    ),
-)
-def mcp_sync_day(start_date: str, end_date: str = "") -> dict:
-    end_date = end_date or start_date
-    logger.info("Tool sync_day called start_date=%s end_date=%s", start_date, end_date)
-    start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
-    days = []
-    with SessionLocal() as db:
-        user_id = _ensure_user_id()
-        for day_date in _iter_date_range(start, end):
-            before_meals, before_items = _cache_counts(db, user_id, day_date)
-            summary = sync_day_from_fitatu(db, client, day_date)
-            after_meals, after_items = _cache_counts(db, summary.user_id, day_date)
-            days.append({
-                "status": "synced",
-                "user_id": summary.user_id,
-                "day_date": summary.day_date,
-                "totals": summary.totals.model_dump(),
-                "cache": {
-                    "meals_before": before_meals,
-                    "meals_after": after_meals,
-                    "items_before": before_items,
-                    "items_after": after_items,
-                },
-            })
-            logger.info("sync_day synced day_date=%s meals=%s items=%s", day_date, after_meals, after_items)
-    return _range_envelope(start_date, end_date, days)
+    username = env.get("FITATU_USERNAME")
+    password = env.get("FITATU_PASSWORD")
+    mcp_api_key = env.get("MCP_API_KEY")
+    if not username or not password:
+        raise RuntimeError("FITATU_USERNAME and FITATU_PASSWORD must be set")
+    if not mcp_api_key:
+        raise RuntimeError("MCP_API_KEY must be set")
 
+    today_ttl = int(env.get("FITATU_TODAY_TTL_SECONDS", "300"))
+    dns_rebind = (env.get("MCP_ENABLE_DNS_REBINDING_PROTECTION", "false").lower() in {"1", "true", "yes", "on"})
+    allowed_hosts_csv = env.get(
+        "MCP_ALLOWED_HOSTS",
+        "localhost,localhost:*,127.0.0.1,127.0.0.1:*,fitatu-mcp,fitatu-mcp:*,host.docker.internal,host.docker.internal:*",
+    )
+    allow_delete = env.get("FITATU_ALLOW_DELETE", "false").lower() in {"1", "true", "yes", "on"}
 
-@mcp.tool(
-    name="get_day_summary",
-    description=(
-        "Get full daily nutrition summary including meals and items for a date range. "
-        "start_date is required (YYYY-MM-DD). end_date defaults to start_date. "
-        "Maximum range: 7 days."
-    ),
-)
-def mcp_get_day_summary(start_date: str, end_date: str = "") -> dict:
-    end_date = end_date or start_date
-    logger.info("Tool get_day_summary called start_date=%s end_date=%s", start_date, end_date)
-    start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_VERBOSE)
-    days = []
-    with SessionLocal() as db:
-        user_id = _ensure_user_id()
-        for day_date in _iter_date_range(start, end):
-            try:
-                day_row = _load_or_sync_day(db, user_id, day_date)
-                days.append(db_day_to_schema(day_row).model_dump())
-            except Exception as exc:
-                logger.warning("get_day_summary failed for day_date=%s: %s", day_date, exc)
-                days.append({"day_date": day_date, "error": str(exc)})
-    return _range_envelope(start_date, end_date, days)
+    client = FitatuClient(
+        username,
+        password,
+        base_url_read=env.get("FITATU_BASE_URL_READ"),
+        base_url_write=env.get("FITATU_BASE_URL_WRITE"),
+    )
 
+    transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=dns_rebind,
+        allowed_hosts=[h.strip() for h in allowed_hosts_csv.split(",") if h.strip()],
+    )
 
-@mcp.tool(
-    name="get_day_macros",
-    description=(
-        "Get macro totals for a date range. "
-        "start_date is required (YYYY-MM-DD). end_date defaults to start_date. "
-        "Maximum range: 31 days."
-    ),
-)
-def mcp_get_day_macros(start_date: str, end_date: str = "") -> dict:
-    end_date = end_date or start_date
-    logger.info("Tool get_day_macros called start_date=%s end_date=%s", start_date, end_date)
-    start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
-    days = []
-    with SessionLocal() as db:
-        user_id = _ensure_user_id()
-        for day_date in _iter_date_range(start, end):
-            try:
-                day_row = _load_or_sync_day(db, user_id, day_date)
-                macros = MacroTotals(
-                    energy=day_row.total_energy,
-                    protein=day_row.total_protein,
-                    fat=day_row.total_fat,
-                    carbohydrate=day_row.total_carbohydrate,
-                    fiber=day_row.total_fiber,
-                    sugars=day_row.total_sugars,
-                    salt=day_row.total_salt,
-                ).model_dump()
-                days.append({"day_date": day_date, **macros})
-            except Exception as exc:
-                logger.warning("get_day_macros failed for day_date=%s: %s", day_date, exc)
-                days.append({"day_date": day_date, "error": str(exc)})
-    return _range_envelope(start_date, end_date, days)
+    mcp = FastMCP(
+        name="fitatu-nutrition-mcp",
+        instructions=(
+            "Use tools to sync, read, and write daily nutrition. "
+            "Meal items (add/update/delete) log what the user actually ate; "
+            "products (create/get/delete/search) manage the user's reusable food catalog."
+        ),
+        streamable_http_path="/",
+        transport_security=transport_security,
+    )
 
+    def _ensure_user_id() -> str:
+        if not client.user_id:
+            client.login()
+        if not client.user_id:
+            raise ValueError("Could not determine user_id after login")
+        return client.user_id
 
-@mcp.tool(
-    name="get_day_meals",
-    description=(
-        "Get meal summaries and meal items for a date range. "
-        "start_date is required (YYYY-MM-DD). end_date defaults to start_date. "
-        "Maximum range: 7 days."
-    ),
-)
-def mcp_get_day_meals(start_date: str, end_date: str = "") -> dict:
-    end_date = end_date or start_date
-    logger.info("Tool get_day_meals called start_date=%s end_date=%s", start_date, end_date)
-    start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_VERBOSE)
-    days = []
-    with SessionLocal() as db:
-        user_id = _ensure_user_id()
-        for day_date in _iter_date_range(start, end):
-            try:
-                day_row = _load_or_sync_day(db, user_id, day_date)
-                summary = db_day_to_schema(day_row)
+    def _load_or_sync_day(db: Session, user_id: str, day_date: str) -> DailyNutrition:
+        day_row = _load_day(db, user_id, day_date)
+        if day_row and not _is_today_stale(day_row, day_date, today_ttl):
+            return day_row
+        if day_row:
+            logger.info("Stale today cache for day_date=%s user_id=%s; triggering re-sync", day_date, user_id)
+        else:
+            logger.info("Cache miss for day_date=%s user_id=%s; triggering auto-sync", day_date, user_id)
+        summary = sync_day_from_fitatu(db, client, day_date)
+        day_row = _load_day(db, summary.user_id, day_date)
+        if not day_row:
+            raise ValueError("Day data not found after auto-sync. Check Fitatu source data.")
+        return day_row
+
+    # -- Existing read tools --
+
+    @mcp.tool(
+        name="sync_day",
+        description=(
+            "Sync daily nutrition from Fitatu into SQLite for a date range. "
+            "start_date is required (YYYY-MM-DD). end_date defaults to start_date. Maximum range: 31 days."
+        ),
+    )
+    def mcp_sync_day(start_date: str, end_date: str = "") -> dict:
+        end_date = end_date or start_date
+        logger.info("Tool sync_day called start_date=%s end_date=%s", start_date, end_date)
+        start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
+        days = []
+        with SessionLocal() as db:
+            user_id = _ensure_user_id()
+            for day_date in _iter_date_range(start, end):
+                before_meals, before_items = _cache_counts(db, user_id, day_date)
+                summary = sync_day_from_fitatu(db, client, day_date)
+                after_meals, after_items = _cache_counts(db, summary.user_id, day_date)
                 days.append({
-                    "day_date": summary.day_date,
+                    "status": "synced",
                     "user_id": summary.user_id,
-                    "meals": [m.model_dump() for m in summary.meals],
-                })
-            except Exception as exc:
-                logger.warning("get_day_meals failed for day_date=%s: %s", day_date, exc)
-                days.append({"day_date": day_date, "error": str(exc)})
-    return _range_envelope(start_date, end_date, days)
-
-
-@mcp.tool(
-    name="get_cache_stats",
-    description=(
-        "Get cached meal/item counts and macro totals for a date range. "
-        "start_date is required (YYYY-MM-DD). end_date defaults to start_date. "
-        "Maximum range: 31 days."
-    ),
-)
-def mcp_get_cache_stats(start_date: str, end_date: str = "") -> dict:
-    end_date = end_date or start_date
-    logger.info("Tool get_cache_stats called start_date=%s end_date=%s", start_date, end_date)
-    start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
-    days = []
-    with SessionLocal() as db:
-        user_id = _ensure_user_id()
-        for day_date in _iter_date_range(start, end):
-            try:
-                day_row = _load_or_sync_day(db, user_id, day_date)
-                days.append({
-                    "day_date": day_row.day_date.isoformat(),
-                    "user_id": day_row.user_id,
-                    "updated_at": day_row.updated_at.isoformat() if day_row.updated_at else None,
-                    "totals": {
-                        "energy": day_row.total_energy,
-                        "protein": day_row.total_protein,
-                        "fat": day_row.total_fat,
-                        "carbohydrate": day_row.total_carbohydrate,
-                        "fiber": day_row.total_fiber,
-                        "sugars": day_row.total_sugars,
-                        "salt": day_row.total_salt,
-                    },
+                    "day_date": summary.day_date,
+                    "totals": summary.totals.model_dump(),
                     "cache": {
-                        "meals": len(day_row.meals),
-                        "items": sum(len(meal.items) for meal in day_row.meals),
-                        "per_meal": [
-                            {"meal_key": meal.meal_key, "meal_name": meal.meal_name, "items": len(meal.items)}
-                            for meal in day_row.meals
-                        ],
+                        "meals_before": before_meals,
+                        "meals_after": after_meals,
+                        "items_before": before_items,
+                        "items_after": after_items,
                     },
                 })
-            except Exception as exc:
-                logger.warning("get_cache_stats failed for day_date=%s: %s", day_date, exc)
-                days.append({"day_date": day_date, "error": str(exc)})
-    return _range_envelope(start_date, end_date, days)
+        return _range_envelope(start_date, end_date, days)
+
+    @mcp.tool(
+        name="get_day_summary",
+        description=(
+            "Get full daily nutrition summary including meals and items for a date range. "
+            "start_date is required (YYYY-MM-DD). end_date defaults to start_date. Maximum range: 7 days."
+        ),
+    )
+    def mcp_get_day_summary(start_date: str, end_date: str = "") -> dict:
+        end_date = end_date or start_date
+        start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_VERBOSE)
+        days = []
+        with SessionLocal() as db:
+            user_id = _ensure_user_id()
+            for day_date in _iter_date_range(start, end):
+                try:
+                    day_row = _load_or_sync_day(db, user_id, day_date)
+                    days.append(db_day_to_schema(day_row).model_dump())
+                except Exception as exc:
+                    logger.warning("get_day_summary failed for day_date=%s: %s", day_date, exc)
+                    days.append({"day_date": day_date, "error": str(exc)})
+        return _range_envelope(start_date, end_date, days)
+
+    @mcp.tool(
+        name="get_day_macros",
+        description=(
+            "Get macro totals for a date range. "
+            "start_date is required (YYYY-MM-DD). end_date defaults to start_date. Maximum range: 31 days."
+        ),
+    )
+    def mcp_get_day_macros(start_date: str, end_date: str = "") -> dict:
+        end_date = end_date or start_date
+        start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
+        days = []
+        with SessionLocal() as db:
+            user_id = _ensure_user_id()
+            for day_date in _iter_date_range(start, end):
+                try:
+                    day_row = _load_or_sync_day(db, user_id, day_date)
+                    macros = MacroTotals(
+                        energy=day_row.total_energy,
+                        protein=day_row.total_protein,
+                        fat=day_row.total_fat,
+                        carbohydrate=day_row.total_carbohydrate,
+                        fiber=day_row.total_fiber,
+                        sugars=day_row.total_sugars,
+                        salt=day_row.total_salt,
+                    ).model_dump()
+                    days.append({"day_date": day_date, **macros})
+                except Exception as exc:
+                    logger.warning("get_day_macros failed for day_date=%s: %s", day_date, exc)
+                    days.append({"day_date": day_date, "error": str(exc)})
+        return _range_envelope(start_date, end_date, days)
+
+    @mcp.tool(
+        name="get_day_meals",
+        description=(
+            "Get meal summaries and meal items for a date range. "
+            "start_date is required (YYYY-MM-DD). end_date defaults to start_date. Maximum range: 7 days."
+        ),
+    )
+    def mcp_get_day_meals(start_date: str, end_date: str = "") -> dict:
+        end_date = end_date or start_date
+        start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_VERBOSE)
+        days = []
+        with SessionLocal() as db:
+            user_id = _ensure_user_id()
+            for day_date in _iter_date_range(start, end):
+                try:
+                    day_row = _load_or_sync_day(db, user_id, day_date)
+                    summary = db_day_to_schema(day_row)
+                    days.append({
+                        "day_date": summary.day_date,
+                        "user_id": summary.user_id,
+                        "meals": [m.model_dump() for m in summary.meals],
+                    })
+                except Exception as exc:
+                    logger.warning("get_day_meals failed for day_date=%s: %s", day_date, exc)
+                    days.append({"day_date": day_date, "error": str(exc)})
+        return _range_envelope(start_date, end_date, days)
+
+    @mcp.tool(
+        name="get_cache_stats",
+        description=(
+            "Get cached meal/item counts and macro totals for a date range. "
+            "start_date is required (YYYY-MM-DD). end_date defaults to start_date. Maximum range: 31 days."
+        ),
+    )
+    def mcp_get_cache_stats(start_date: str, end_date: str = "") -> dict:
+        end_date = end_date or start_date
+        start, end = _validate_date_range(start_date, end_date, MAX_RANGE_DAYS_COMPACT)
+        days = []
+        with SessionLocal() as db:
+            user_id = _ensure_user_id()
+            for day_date in _iter_date_range(start, end):
+                try:
+                    day_row = _load_or_sync_day(db, user_id, day_date)
+                    days.append({
+                        "day_date": day_row.day_date.isoformat(),
+                        "user_id": day_row.user_id,
+                        "updated_at": day_row.updated_at.isoformat() if day_row.updated_at else None,
+                        "totals": {
+                            "energy": day_row.total_energy,
+                            "protein": day_row.total_protein,
+                            "fat": day_row.total_fat,
+                            "carbohydrate": day_row.total_carbohydrate,
+                            "fiber": day_row.total_fiber,
+                            "sugars": day_row.total_sugars,
+                            "salt": day_row.total_salt,
+                        },
+                        "cache": {
+                            "meals": len(day_row.meals),
+                            "items": sum(len(meal.items) for meal in day_row.meals),
+                            "per_meal": [
+                                {"meal_key": meal.meal_key, "meal_name": meal.meal_name, "items": len(meal.items)}
+                                for meal in day_row.meals
+                            ],
+                        },
+                    })
+                except Exception as exc:
+                    logger.warning("get_cache_stats failed for day_date=%s: %s", day_date, exc)
+                    days.append({"day_date": day_date, "error": str(exc)})
+        return _range_envelope(start_date, end_date, days)
+
+    # -- Product write tools (Group 5) --
+
+    @mcp.tool(
+        name="create_custom_product",
+        description=(
+            "Create a user-owned product in the Fitatu catalog. Returns the product id and a local cache row. "
+            "Macros are per 100g. Use -1 sentinel for optional macros to skip them."
+        ),
+    )
+    def mcp_create_custom_product(
+        name: str,
+        energy: float,
+        protein: float,
+        fat: float,
+        carbohydrate: float,
+        brand: str = "",
+        fiber: float = -1,
+        sodium: float = -1,
+        salt: float = -1,
+        saturated_fat: float = -1,
+        sugars: float = -1,
+        cholesterol: float = -1,
+    ) -> dict:
+        name_clean = (name or "").strip()
+        if not name_clean:
+            raise ValueError("name must not be empty")
+        if len(name_clean) > 200:
+            raise ValueError("name must be 200 characters or fewer")
+        for label, value in (("energy", energy), ("protein", protein), ("fat", fat), ("carbohydrate", carbohydrate)):
+            if value < 0:
+                raise ValueError(f"{label} must be >= 0 (got {value})")
+
+        payload: dict = {
+            "name": name_clean,
+            "energy": energy,
+            "protein": protein,
+            "fat": fat,
+            "carbohydrate": carbohydrate,
+        }
+        if brand and brand.strip():
+            payload["brand"] = brand.strip()
+        for src, dest in (
+            ("fiber", "fiber"),
+            ("sodium", "sodium"),
+            ("salt", "salt"),
+            ("saturated_fat", "saturatedFat"),
+            ("sugars", "sugars"),
+            ("cholesterol", "cholesterol"),
+        ):
+            v = locals()[src]
+            if v is not None and v != -1:
+                payload[dest] = v
+
+        _ensure_user_id()
+        created = client.create_product(payload)
+        product_id = created.get("id")
+        if product_id is None:
+            raise RuntimeError(f"create_product returned no id: {created}")
+
+        with SessionLocal() as db:
+            local_cached = True
+            try:
+                full = client.get_product(int(product_id))
+            except RuntimeError as exc:
+                logger.warning("Post-create get_product failed: %s", exc)
+                full = {"id": int(product_id), "name": name_clean, **{k: v for k, v in payload.items() if k != "name"}}
+                local_cached = False
+            product = service.upsert_product(db, full, source="custom")
+            db.commit()
+            schema = service.product_to_schema(product)
+        return {"ok": True, "product": schema.model_dump(mode="json"), "local_cached": local_cached}
+
+    @mcp.tool(
+        name="get_product",
+        description="Get a single product by id. Reads local cache first; falls through to Fitatu on miss.",
+    )
+    def mcp_get_product(product_id: int) -> dict:
+        if product_id <= 0:
+            raise ValueError("product_id must be a positive integer")
+        with SessionLocal() as db:
+            local = service.get_product_local(db, product_id)
+            if local is not None:
+                return {"ok": True, "product": service.product_to_schema(local).model_dump(mode="json"), "from_cache": True}
+            _ensure_user_id()
+            full = client.get_product(product_id)
+            product = service.upsert_product(db, full, source="catalog")
+            db.commit()
+            return {"ok": True, "product": service.product_to_schema(product).model_dump(mode="json"), "from_cache": False}
+
+    @mcp.tool(
+        name="search_products",
+        description=(
+            "Search products. scope='custom' uses local LIKE; scope='catalog' raises pending payload contract; "
+            "scope='all' returns custom results plus a warning."
+        ),
+    )
+    def mcp_search_products(query: str, scope: str = "custom", limit: int = 20) -> dict:
+        q = (query or "").strip()
+        if len(q) < 2:
+            raise ValueError("query must be at least 2 characters")
+        if scope not in {"custom", "catalog", "all"}:
+            raise ValueError("scope must be one of custom|catalog|all")
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+
+        if scope == "catalog":
+            raise RuntimeError(
+                "Catalog search not yet wired — payload contract pending. "
+                "Use scope='custom' or pass exact product_id."
+            )
+
+        with SessionLocal() as db:
+            rows = service.search_products_local(db, q, scope, limit)
+            results = [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    "brand": r.brand,
+                    "energy": r.energy,
+                    "source": r.source,
+                }
+                for r in rows
+            ]
+        envelope = {"ok": True, "query": q, "scope": scope, "results": results}
+        if scope == "all":
+            envelope["warnings"] = ["catalog search unavailable — payload contract pending"]
+        return envelope
+
+    # -- Meal-item write tools (Group 9, spec §15 — PRIMARY user goal) --
+
+    @mcp.tool(
+        name="add_meal_item",
+        description=(
+            "Log a meal item: 'I ate X amount of product Y for breakfast on date Z'. "
+            "Pass date (YYYY-MM-DD), meal_key (breakfast|second_breakfast|lunch|dinner|snack|supper), "
+            "product_id (from search_products or create_custom_product), "
+            "measure_id (from product's measures[].id), measure_quantity (number of servings)."
+        ),
+    )
+    def mcp_add_meal_item(
+        date: str,
+        meal_key: str,
+        product_id: int,
+        measure_id: int,
+        measure_quantity: float,
+    ) -> dict:
+        if product_id <= 0:
+            raise ValueError("product_id must be a positive integer")
+        _ensure_user_id()
+        with SessionLocal() as db:
+            result = service.add_meal_item(
+                db, client, date, meal_key, product_id, measure_id, measure_quantity,
+            )
+            db.commit()
+            return result
+
+    @mcp.tool(
+        name="update_meal_item",
+        description=(
+            "Update an existing meal item's quantity. Internally posts a new item then deletes the old one "
+            "(no PUT endpoint exists). If cleanup of the old item fails, the response includes "
+            "`cleanup_failed: true` and a warning."
+        ),
+    )
+    def mcp_update_meal_item(
+        date: str,
+        meal_key: str,
+        plan_day_diet_item_id: str,
+        new_measure_quantity: float,
+    ) -> dict:
+        _ensure_user_id()
+        with SessionLocal() as db:
+            result = service.update_meal_item(
+                db, client, date, meal_key, plan_day_diet_item_id, new_measure_quantity,
+            )
+            db.commit()
+            return result
+
+    if allow_delete:
+        @mcp.tool(
+            name="delete_custom_product",
+            description="Delete a user-owned product from the Fitatu catalog (and local cache). Requires FITATU_ALLOW_DELETE=true.",
+        )
+        def mcp_delete_custom_product(product_id: int) -> dict:
+            if product_id <= 0:
+                raise ValueError("product_id must be a positive integer")
+            _ensure_user_id()
+            client.delete_product(product_id)
+            with SessionLocal() as db:
+                service.delete_product(db, product_id)
+                db.commit()
+            return {"ok": True, "deleted": True, "product_id": product_id}
+
+        @mcp.tool(
+            name="delete_meal_item",
+            description=(
+                "Remove a logged meal item. Requires FITATU_ALLOW_DELETE=true. "
+                "Pass delete_all_related_meals=true ONLY if the user explicitly wants to remove all "
+                "instances of this item across the week (server-side feature)."
+            ),
+        )
+        def mcp_delete_meal_item(
+            date: str,
+            meal_key: str,
+            plan_day_diet_item_id: str,
+            delete_all_related_meals: bool = False,
+        ) -> dict:
+            _ensure_user_id()
+            with SessionLocal() as db:
+                result = service.delete_meal_item(
+                    db, client, date, meal_key, plan_day_diet_item_id, delete_all_related_meals,
+                )
+                db.commit()
+                return result
+
+    mcp_app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info("Server startup: initializing DB and MCP session manager")
+        init_db()
+        async with mcp.session_manager.run():
+            yield
+
+    app = FastAPI(
+        title="Fitatu Nutrition MCP Server",
+        version="1.0.0",
+        description="MCP server exposing daily meals and macro nutrient information",
+        lifespan=lifespan,
+    )
+
+    # Expose for testing introspection
+    app.state.fitatu_client = client
+    app.state.mcp = mcp
+
+    @app.middleware("http")
+    async def bearer_auth(request: Request, call_next):
+        if request.url.path.startswith("/mcp"):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[7:] != mcp_api_key:
+                logger.warning(
+                    "Unauthorized MCP request path=%s client=%s auth_prefix=%s",
+                    request.url.path,
+                    request.client.host if request.client else "unknown",
+                    auth[:16],
+                )
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    app.mount("/mcp", mcp_app)
+    return app, mcp
 
 
-app.mount("/mcp", mcp_app)
+# Module-level app/mcp for uvicorn entrypoint.
+app, mcp = build_app()

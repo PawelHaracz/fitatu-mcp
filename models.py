@@ -90,3 +90,29 @@ class MealItem(Base):
     eaten: Mapped[bool] = mapped_column(Boolean, default=False)
 
     meal: Mapped[MealNutrition] = relationship(back_populates="items")
+
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    brand: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    energy: Mapped[float] = mapped_column(Float)
+    protein: Mapped[float] = mapped_column(Float)
+    fat: Mapped[float] = mapped_column(Float)
+    carbohydrate: Mapped[float] = mapped_column(Float)
+    fiber: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sodium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    salt: Mapped[float | None] = mapped_column(Float, nullable=True)
+    saturated_fat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sugars: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cholesterol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw: Mapped[str | None] = mapped_column(String, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="custom")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

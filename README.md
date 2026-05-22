@@ -1,82 +1,139 @@
-# Fitatu Nutrition MCP Server (FastAPI)
+# Fitatu Nutrition MCP Server
 
-This server exposes daily nutrition data (meals and macros) through MCP HTTP Streamable transport.
-SQLite is used as a cache layer.
-Sync is additive: only new meal items are inserted; existing cached items are preserved.
+An [MCP](https://modelcontextprotocol.io) server that mirrors a user's daily Fitatu nutrition (meals + macros) into a local SQLite cache and exposes it over MCP Streamable HTTP. Sync is additive — known meal items are kept and new ones merged on each `sync_day`.
+
+- Transport: **MCP Streamable HTTP** (FastMCP, mounted under `/mcp`).
+- Inbound auth: static `Authorization: Bearer <MCP_API_KEY>`.
+- Outbound auth: Fitatu username/password + the `api-secret` header used by the web app.
+- Cache: SQLite at `${FITATU_DB_FILE:-/data/fitatu_nutrition.db}`.
 
 ## Endpoints
 
-- `GET /health`
-- MCP Streamable HTTP endpoint: `/mcp`
+- `GET /health` — public, returns `{"status": "ok"}`.
+- `POST /mcp/` — MCP entry point (requires `Authorization: Bearer ${MCP_API_KEY}`).
 
-## MCP tools (HTTP Streamable)
+## MCP tools
 
-- `sync_day(day_date)`
-- `get_day_summary(day_date)`
-- `get_day_macros(day_date)`
-- `get_day_meals(day_date)`
-- `get_cache_stats(day_date)`
+All date params are `YYYY-MM-DD`. Read tools accept a `start_date` and optional `end_date` (defaults to `start_date`).
 
-`sync_day` also returns:
-- `cache_delta`: newly added meals/items in this sync run
-- `cache_totals`: total cached meals/items for that day
+### Read tools
 
-Parameter format: `day_date = "YYYY-MM-DD"`
+| Tool | Description | Max range |
+|------|-------------|-----------|
+| `sync_day(start_date, end_date?)` | Pull from Fitatu into SQLite. Reports `cache_before/after` per day. | 31 d |
+| `get_day_summary(start_date, end_date?)` | Full day: meals + items + totals. Auto-syncs on cache miss / stale today. | 7 d |
+| `get_day_macros(start_date, end_date?)` | Macro totals only (energy/protein/fat/carbs/fiber/sugars/salt). | 31 d |
+| `get_day_meals(start_date, end_date?)` | Meal summaries + items. | 7 d |
+| `get_cache_stats(start_date, end_date?)` | Cached counts (meals/items, per-meal breakdown) and totals. | 31 d |
 
-## Local run
+`sync_day` is the only read tool that always hits Fitatu. The rest read SQLite and only trigger a sync if today's row is older than `FITATU_TODAY_TTL_SECONDS` (default 300 s) or the day is missing.
 
-Set credentials:
+### Write tools — meal items (log what you ate)
 
-- `FITATU_USERNAME`
-- `FITATU_PASSWORD`
-- `FITATU_API_SECRET` — can be obtained by inspecting network requests in the Fitatu web app (e.g. via browser DevTools); look for the `api-secret` (or similar) header in authenticated API calls
+| Tool | Description |
+|------|-------------|
+| `add_meal_item(date, meal_key, product_id, measure_id, measure_quantity)` | Log "I ate X servings of product Y for breakfast on Z". `meal_key` ∈ `breakfast`, `second_breakfast`, `lunch`, `dinner`, `snack`, `supper`. Returns the new `plan_day_diet_item_id` and a fresh day envelope. |
+| `update_meal_item(date, meal_key, plan_day_diet_item_id, new_measure_quantity)` | Change a logged item's quantity. Internally POSTs a new item then DELETEs the old (no PUT exists). On cleanup failure, response includes `cleanup_failed: true` + warning. |
+| `delete_meal_item(date, meal_key, plan_day_diet_item_id, delete_all_related_meals=false)` | Remove a logged item. **Gated by `FITATU_ALLOW_DELETE=true`** (default false → tool not registered). |
 
-Then run:
+### Write tools — products (manage your reusable food catalog)
 
-**PowerShell:**
-```powershell
-pip install -r mcp_server/requirements.txt
-$env:FITATU_USERNAME="your_email"
-$env:FITATU_PASSWORD="your_password"
-$env:FITATU_API_SECRET="your_api_secret"
+| Tool | Description |
+|------|-------------|
+| `create_custom_product(name, energy, protein, fat, carbohydrate, ...)` | Create a user-owned product. Macros per 100g. Returns the new product id + local cache row. |
+| `get_product(product_id)` | Fetch a product by id. Reads local cache first; falls through to Fitatu on miss. |
+| `search_products(query, scope="custom", limit=20)` | Search by name. `scope="custom"` returns local LIKE matches. `scope="catalog"` raises (payload contract pending — use `search_food` via internal client for now). `scope="all"` returns custom-only + a warning. |
+| `delete_custom_product(product_id)` | Remove a user-owned product from both Fitatu and the local cache. **Gated by `FITATU_ALLOW_DELETE=true`**. |
+
+Writes hit `https://www.fitatu.com/api` (the canonical web app cluster). Reads still go to `https://pl-pl.fitatu.com`. Both can be overridden with `FITATU_BASE_URL_READ` / `FITATU_BASE_URL_WRITE`.
+
+## Quick start (docker compose)
+
+```bash
+cp .env.example .env
+# Fill in FITATU_USERNAME / FITATU_PASSWORD / FITATU_API_SECRET,
+# generate MCP_API_KEY and N8N_ENCRYPTION_KEY with `openssl rand -hex 32`.
+docker compose up -d --build
+```
+
+This brings up two services:
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| `fitatu-mcp` | `http://localhost:8000/mcp/` | The MCP server (auth: bearer `MCP_API_KEY`). |
+| `n8n` | `http://localhost:5678` | Workflow editor; finish owner setup on first visit. |
+
+Inside the compose network, n8n reaches the MCP server at `http://fitatu-mcp:8000/mcp/`. The SQLite cache lives in the `fitatu_data` volume; n8n state in `n8n_data`.
+
+To pull the pre-built image instead of building locally, set `FITATU_MCP_IMAGE` in `.env` (e.g. `ghcr.io/pawelharacz/fitatu-mcp:latest`) and run `docker compose pull && docker compose up -d`.
+
+## Where to find `FITATU_API_SECRET`
+
+The Fitatu mobile/web client signs requests with a static `api-secret` header. Inspect any authenticated XHR in DevTools (Network tab) and copy that value. The MCP server uses the same header so the upstream login flow is accepted.
+
+## n8n integration
+
+In a workflow, use the **MCP Client** node (or the AI Agent's tool selector) configured as:
+
+- Transport: **HTTP Streamable**
+- URL: `http://fitatu-mcp:8000/mcp/`
+- Headers: `Authorization: Bearer <MCP_API_KEY>`
+
+Then call `sync_day` once for the date range you care about, and chain `get_day_macros` / `get_day_summary` for downstream work.
+
+## Local run (without Docker)
+
+The Python files use relative imports, so the package must be importable as `mcp_server`. The simplest layout is to keep this repo as that package (clone into a directory named `mcp_server`, or `pip install -e` it).
+
+```bash
+pip install -r requirements.txt
+export FITATU_USERNAME=you@example.com
+export FITATU_PASSWORD=…
+export FITATU_API_SECRET=…
+export MCP_API_KEY=$(openssl rand -hex 32)
+export FITATU_DB_FILE=./fitatu_nutrition.db
 python -m uvicorn mcp_server.server:app --host 0.0.0.0 --port 8000
 ```
 
-**bash/zsh:**
-```bash
-pip install -r mcp_server/requirements.txt
-export FITATU_USERNAME="your_email"
-export FITATU_PASSWORD="your_password"
-export FITATU_API_SECRET="your_api_secret"
-python -m uvicorn mcp_server.server:app --host 0.0.0.0 --port 8000
-```
+## Publishing the image
 
-## Docker
+`.github/workflows/docker.yml` builds multi-arch (`linux/amd64`, `linux/arm64`) images and pushes to GHCR on:
 
-Build image:
+- pushes to `main` (tagged `latest` and `sha-<short>`)
+- tags matching `v*.*.*` (semver tags)
+- manual `workflow_dispatch`
+
+Pull with:
 
 ```bash
-docker build -t fitatu-mcp-server ./mcp_server
+docker pull ghcr.io/pawelharacz/fitatu-mcp:latest
 ```
 
-Run container (username/password passed at runtime):
+The image runs as UID 1000, exposes 8000, declares a `/health` HEALTHCHECK, and honors `--proxy-headers` so it's safe behind a reverse proxy that terminates TLS.
+
+## Configuration reference
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FITATU_USERNAME` | — | Fitatu account email. |
+| `FITATU_PASSWORD` | — | Fitatu account password. |
+| `FITATU_API_SECRET` | — | `api-secret` header value used by the Fitatu app. |
+| `MCP_API_KEY` | — | Shared secret required on every MCP request. |
+| `FITATU_DB_FILE` | `/data/fitatu_nutrition.db` | SQLite path inside the container. |
+| `FITATU_TODAY_TTL_SECONDS` | `300` | How long today's row is treated as fresh. |
+| `FITATU_BASE_URL_READ` | `https://pl-pl.fitatu.com` | Override Fitatu cluster for reads. |
+| `FITATU_BASE_URL_WRITE` | `https://www.fitatu.com` | Override Fitatu cluster for writes (no `/api` suffix; client appends it). |
+| `FITATU_ALLOW_DELETE` | `false` | Set to `true` to register `delete_custom_product` and `delete_meal_item`. |
+| `LOG_LEVEL` | `INFO` | Python logging level. |
+| `MCP_ENABLE_DNS_REBINDING_PROTECTION` | `false` | Toggle DNS-rebinding guard. |
+| `MCP_ALLOWED_HOSTS` | (compose-friendly list) | Allowlist used when rebinding protection is on. |
+
+## Running tests
 
 ```bash
-docker run --rm -p 8000:8000 \
-  -e FITATU_USERNAME="your_email" \
-  -e FITATU_PASSWORD="your_password" \
-  -e FITATU_API_SECRET="your_api_secret" \
-  -e FITATU_DB_FILE="/data/fitatu_nutrition.db" \
-  -v "${PWD}/data:/data" \
-  fitatu-mcp-server
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest tests/
 ```
 
-Use MCP tool `sync_day` first, then read data with the remaining tools.
-
-## n8n MCP integration
-
-Configure MCP client in n8n to use HTTP Streamable transport with URL:
-
-- `http://<host>:8000/mcp/`
-
-Use MCP tools listed above directly in n8n flows.
+Tests use in-memory SQLite and mock all Fitatu HTTP. No live credentials needed.

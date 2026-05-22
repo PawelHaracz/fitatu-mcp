@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MacroTotals(BaseModel):
@@ -45,3 +47,23 @@ class DaySummarySchema(BaseModel):
     day_date: str
     totals: MacroTotals = Field(default_factory=MacroTotals)
     meals: list[MealSummarySchema] = Field(default_factory=list)
+
+
+class ProductSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    brand: str | None = None
+    energy: float
+    protein: float
+    fat: float
+    carbohydrate: float
+    fiber: float | None = None
+    sodium: float | None = None
+    salt: float | None = None
+    saturated_fat: float | None = None
+    sugars: float | None = None
+    cholesterol: float | None = None
+    source: str
+    created_at: datetime

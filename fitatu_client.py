@@ -2,13 +2,17 @@ import base64
 import json
 import logging
 import os
+import random
+import uuid
 from typing import Any
 
 import requests
 
-LOGIN_URL = "https://pl-pl.fitatu.com/api/login"
-REFRESH_URL = "https://pl-pl.fitatu.com/api/token/refresh"
-DAY_URL_TEMPLATE = "https://pl-pl.fitatu.com/api/diet-and-activity-plan/{user_id}/day/{date}"
+BASE_URL_READ = "https://pl-pl.fitatu.com"
+BASE_URL_WRITE = "https://www.fitatu.com/api"
+
+LOGIN_PATH = "/api/login"
+REFRESH_PATH = "/api/token/refresh"
 
 FITATU_API_SECRET = os.getenv("FITATU_API_SECRET")
 if not FITATU_API_SECRET:
@@ -34,12 +38,27 @@ logger = logging.getLogger(__name__)
 
 
 class FitatuClient:
-    def __init__(self, username: str, password: str) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        *,
+        base_url_read: str | None = None,
+        base_url_write: str | None = None,
+    ) -> None:
         self.username = username
         self.password = password
         self.token: str | None = None
         self.refresh_token: str | None = None
         self.user_id: str | None = None
+        self.base_url_read = base_url_read or BASE_URL_READ
+        self.base_url_write = base_url_write or BASE_URL_WRITE
+        # UUID v1 node: random per-process 48-bit value with multicast bit set,
+        # to avoid leaking host MAC to Fitatu (spec §15.4 L1).
+        self._uuid_node = random.getrandbits(48) | (1 << 40)
+
+    def _gen_uuid(self) -> str:
+        return str(uuid.uuid1(node=self._uuid_node))
 
     @staticmethod
     def _decode_jwt_payload(token: str | None) -> dict[str, Any] | None:
@@ -84,7 +103,12 @@ class FitatuClient:
     def login(self) -> None:
         logger.info("Fitatu login attempt started")
         payload = {"_username": self.username, "_password": self.password}
-        response = requests.post(LOGIN_URL, headers=BASE_HEADERS, json=payload, timeout=20)
+        response = requests.post(
+            f"{self.base_url_read}{LOGIN_PATH}",
+            headers=BASE_HEADERS,
+            json=payload,
+            timeout=20,
+        )
         logger.info("Fitatu login response status=%s", response.status_code)
         if response.status_code != 200:
             raise FitatuAuthError(f"Login failed with status {response.status_code}: {response.text}")
@@ -120,7 +144,12 @@ class FitatuClient:
 
         logger.info("Fitatu token refresh attempt started")
         for payload in payload_variants:
-            response = requests.post(REFRESH_URL, headers=BASE_HEADERS, json=payload, timeout=20)
+            response = requests.post(
+                f"{self.base_url_read}{REFRESH_PATH}",
+                headers=BASE_HEADERS,
+                json=payload,
+                timeout=20,
+            )
             logger.info("Fitatu refresh response status=%s", response.status_code)
             if response.status_code != 200:
                 continue
@@ -139,31 +168,132 @@ class FitatuClient:
         logger.warning("Fitatu token refresh failed for all payload variants")
         return False
 
-    def get_day(self, day_date: str) -> dict[str, Any]:
-        if not self.token or not self.user_id:
-            logger.info("No active Fitatu session; performing login before get_day")
-            self.login()
-
+    def _build_auth_headers(self, accept_version: str = "v3") -> dict[str, str]:
         headers = BASE_HEADERS.copy()
         headers["Authorization"] = f"Bearer {self.token}"
         headers["API-Cluster"] = f"pl-pl{self.user_id}"
-        url = DAY_URL_TEMPLATE.format(user_id=self.user_id, date=day_date)
-        logger.info("Fetching Fitatu day data day_date=%s user_id=%s", day_date, self.user_id)
+        # Override accept header to use requested version (existing default already v3).
+        headers["accept"] = f"application/json; version={accept_version}"
+        return headers
 
-        response = requests.get(url, headers=headers, timeout=20)
-        logger.info("Fitatu get_day response status=%s", response.status_code)
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        params: dict | None = None,
+        accept_version: str = "v3",
+        base_url: str | None = None,
+    ) -> requests.Response:
+        if not self.token or not self.user_id:
+            logger.info("No active Fitatu session; performing login before %s %s", method, path)
+            self.login()
+
+        effective_base = base_url if base_url is not None else self.base_url_read
+        url = f"{effective_base}{path}"
+        headers = self._build_auth_headers(accept_version=accept_version)
+
+        logger.info("Fitatu request method=%s url=%s", method, url)
+        response = requests.request(method, url, headers=headers, json=json, params=params, timeout=20)
+        logger.info("Fitatu response status=%s url=%s", response.status_code, url)
+
+        if response.status_code != 401:
+            return response
+
+        logger.warning("Fitatu %s %s returned 401; attempting refresh/login recovery", method, url)
+        recovered = self.refresh()
+        if not recovered:
+            self.login()
+        headers = self._build_auth_headers(accept_version=accept_version)
+        response = requests.request(method, url, headers=headers, json=json, params=params, timeout=20)
+        logger.info("Fitatu retry response status=%s url=%s", response.status_code, url)
         if response.status_code == 401:
-            logger.warning("Fitatu get_day returned 401; attempting refresh/login recovery")
-            if not self.refresh():
-                self.login()
-                headers["Authorization"] = f"Bearer {self.token}"
-            else:
-                headers["Authorization"] = f"Bearer {self.token}"
-            response = requests.get(url, headers=headers, timeout=20)
-            logger.info("Fitatu get_day retry response status=%s", response.status_code)
+            raise RuntimeError(f"Authenticated request failed: 401 after refresh+relogin (url={url})")
+        return response
 
+    def get_day(self, day_date: str) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"/api/diet-and-activity-plan/{self.user_id}/day/{day_date}",
+        )
         if response.status_code != 200:
             raise RuntimeError(f"get_day failed with status {response.status_code}: {response.text}")
-
         logger.info("Fitatu day fetch succeeded day_date=%s", day_date)
         return response.json()
+
+    # -- Product writes (read-cluster; pl-pl.fitatu.com) --
+
+    def create_product(self, payload: dict) -> dict[str, Any]:
+        response = self._request("POST", "/api/products", json=payload)
+        if response.status_code != 201:
+            raise RuntimeError(f"create_product failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    def get_product(self, product_id: int) -> dict[str, Any]:
+        response = self._request("GET", f"/api/products/{product_id}")
+        if response.status_code != 200:
+            raise RuntimeError(f"get_product failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    def delete_product(self, product_id: int) -> dict[str, Any]:
+        response = self._request("DELETE", f"/api/products/{product_id}")
+        if response.status_code != 200:
+            raise RuntimeError(f"delete_product failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    def search_products(self, query: str, scope: str, limit: int) -> list[dict] | None:
+        """Stub: Path A unresolved. Path B (local LIKE) lives in service.py.
+
+        Returns None to signal "use local fallback" to caller.
+        """
+        return None
+
+    # -- Day-item writes (write-cluster; www.fitatu.com/api) --
+
+    def search_food(
+        self,
+        phrase: str,
+        page: int = 1,
+        limit: int = 40,
+        access_types: list[str] | None = None,
+    ) -> list[dict]:
+        """GET {BASE_URL_WRITE}/search/food/user/{userId} for product search."""
+        types = access_types or ["FREE"]
+        params: dict[str, Any] = {
+            "phrase": phrase,
+            "page": page,
+            "limit": limit,
+            "accessType[]": types,
+        }
+        response = self._request(
+            "GET",
+            f"/search/food/user/{self.user_id}",
+            params=params,
+            base_url=self.base_url_write,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"search_food failed: {response.status_code} {response.text[:200]}")
+        return response.json()
+
+    def post_day_items(self, date: str, items: list[dict]) -> "requests.Response":
+        return self._request(
+            "POST",
+            f"/diet-plan/{self.user_id}/day-items/{date}",
+            json={"items": items},
+            base_url=self.base_url_write,
+        )
+
+    def delete_day_item(
+        self,
+        date: str,
+        meal_key: str,
+        plan_day_diet_item_id: str,
+        delete_all_related_meals: bool = False,
+    ) -> "requests.Response":
+        return self._request(
+            "DELETE",
+            f"/diet-plan/{self.user_id}/day/{date}/{meal_key}/{plan_day_diet_item_id}",
+            params={"deleteAllRelatedMeals": str(delete_all_related_meals).lower()},
+            base_url=self.base_url_write,
+        )

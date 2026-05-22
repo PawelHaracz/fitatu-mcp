@@ -1,10 +1,12 @@
+import json
 from datetime import datetime
 import logging
-from sqlalchemy.orm import joinedload, object_session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload, object_session
 
 from .fitatu_client import FitatuClient
-from .models import DailyNutrition, MealItem, MealNutrition
-from .schemas import DaySummarySchema, MacroTotals, MealItemSchema, MealSummarySchema
+from .models import DailyNutrition, MealItem, MealNutrition, Product
+from .schemas import DaySummarySchema, MacroTotals, MealItemSchema, MealSummarySchema, ProductSchema
 
 
 logger = logging.getLogger(__name__)
@@ -328,3 +330,295 @@ def db_day_to_schema(day_row: DailyNutrition) -> DaySummarySchema:
         ),
         meals=meals,
     )
+
+
+# -- Product (custom catalog) helpers --
+
+_PRODUCT_COLUMN_KEYS = {
+    "name", "brand", "energy", "protein", "fat", "carbohydrate",
+    "fiber", "sodium", "salt", "saturated_fat", "sugars", "cholesterol",
+}
+
+_FITATU_TO_LOCAL = {
+    "saturatedFat": "saturated_fat",
+}
+
+
+def upsert_product(db: Session, payload: dict, source: str = "custom") -> Product:
+    """Insert or update a Product row keyed by Fitatu product id.
+
+    Maps Fitatu's response keys (camelCase) to local snake_case columns.
+    Stores the full payload as a JSON string in `raw` for forensics.
+    """
+    product_id = payload.get("id")
+    if product_id is None:
+        raise ValueError("upsert_product payload missing 'id'")
+
+    column_values: dict = {}
+    for src_key, value in payload.items():
+        target_key = _FITATU_TO_LOCAL.get(src_key, src_key)
+        if target_key in _PRODUCT_COLUMN_KEYS:
+            column_values[target_key] = value
+
+    raw_json = json.dumps(payload, default=str)
+
+    existing = db.get(Product, product_id)
+    if existing is None:
+        product = Product(
+            id=product_id,
+            source=source,
+            raw=raw_json,
+            **column_values,
+        )
+        db.add(product)
+        return product
+
+    for k, v in column_values.items():
+        setattr(existing, k, v)
+    existing.raw = raw_json
+    # Source is sticky: don't downgrade a custom row to catalog by re-fetching.
+    if existing.source != source and source == "custom":
+        existing.source = source
+    return existing
+
+
+def get_product_local(db: Session, product_id: int) -> Product | None:
+    return db.get(Product, product_id)
+
+
+def delete_product(db: Session, product_id: int) -> bool:
+    existing = db.get(Product, product_id)
+    if existing is None:
+        return False
+    db.delete(existing)
+    return True
+
+
+def search_products_local(db: Session, query: str, scope: str, limit: int) -> list[Product]:
+    stmt = select(Product).where(Product.name.ilike(f"%{query}%"))
+    if scope == "custom":
+        stmt = stmt.where(Product.source == "custom")
+    elif scope == "catalog":
+        stmt = stmt.where(Product.source == "catalog")
+    elif scope != "all":
+        raise ValueError(f"scope must be one of custom|catalog|all (got {scope!r})")
+    stmt = stmt.limit(limit)
+    return list(db.execute(stmt).scalars())
+
+
+def product_to_schema(p: Product) -> ProductSchema:
+    return ProductSchema.model_validate(p)
+
+
+# -- Meal-item write helpers (spec §15) --
+
+MEAL_KEYS_VALID: frozenset[str] = frozenset({
+    "breakfast", "second_breakfast", "lunch", "dinner", "snack", "supper",
+})
+
+_DAY_DATE_RE = __import__("re").compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_meal_key(meal_key: str) -> None:
+    if meal_key not in MEAL_KEYS_VALID:
+        raise ValueError(
+            f"meal_key {meal_key!r} not in {sorted(MEAL_KEYS_VALID)}"
+        )
+
+
+def _validate_day_date(day_date: str) -> None:
+    if not _DAY_DATE_RE.match(day_date or ""):
+        raise ValueError(f"date must be YYYY-MM-DD (got {day_date!r})")
+
+
+def _resolve_product_for_meal_item(db: Session, client: FitatuClient, product_id: int) -> dict:
+    """Cache-first product lookup; falls through to client.get_product.
+
+    Returns the full product dict (with measures[]) suitable for meal-item assembly.
+    """
+    local = get_product_local(db, product_id)
+    if local is not None and local.raw:
+        try:
+            return json.loads(local.raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Corrupt raw JSON for product %s; refetching", product_id)
+
+    try:
+        full = client.get_product(product_id)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Product {product_id} not found in Fitatu") from exc
+    upsert_product(db, full, source="catalog" if local is None else local.source)
+    db.flush()
+    return full
+
+
+def _build_meal_item_payload(client: FitatuClient, product: dict, meal_key: str,
+                              measure_id: int, measure_quantity: float) -> tuple[str, dict]:
+    """Compute meal-item POST body per spec §15.4 with full pro-rated nutrition.
+
+    Returns (planDayDietItemId, item_dict).
+    """
+    measures = product.get("measures") or []
+    measure = next((m for m in measures if m.get("id") == measure_id), None)
+    if measure is None:
+        raise ValueError(
+            f"measure_id {measure_id} not present in product {product.get('id')}.measures[]"
+        )
+
+    weight_per_unit = safe_float(measure.get("weightPerUnit"))
+    total_weight = weight_per_unit * measure_quantity
+
+    def prorate(field: str) -> float:
+        if weight_per_unit <= 0:
+            return 0.0
+        return safe_float(product.get(field)) * total_weight / 100.0
+
+    plan_day_diet_item_id = client._gen_uuid()
+    item = {
+        "planDayDietItemId": plan_day_diet_item_id,
+        "itemId": product["id"],
+        "foodType": "PRODUCT",
+        "type": "PRODUCT",
+        "measureId": measure_id,
+        "measureQuantity": measure_quantity,
+        "meal": meal_key,
+        "weight": total_weight,
+        "energy": prorate("energy"),
+        "protein": prorate("protein"),
+        "fat": prorate("fat"),
+        "carbohydrate": prorate("carbohydrate"),
+        "fiber": prorate("fiber"),
+        "sugars": prorate("sugars"),
+        "salt": prorate("salt"),
+    }
+    return plan_day_diet_item_id, item
+
+
+def add_meal_item(
+    db: Session,
+    client: FitatuClient,
+    date: str,
+    meal_key: str,
+    product_id: int,
+    measure_id: int,
+    measure_quantity: float,
+) -> dict:
+    """Log a meal item: POST one item to {BASE_URL_WRITE}/diet-plan/{userId}/day-items/{date}."""
+    _validate_day_date(date)
+    _validate_meal_key(meal_key)
+    if measure_quantity <= 0:
+        raise ValueError(f"measure_quantity must be > 0 (got {measure_quantity})")
+
+    product = _resolve_product_for_meal_item(db, client, product_id)
+    plan_id, item = _build_meal_item_payload(client, product, meal_key, measure_id, measure_quantity)
+
+    response = client.post_day_items(date, [item])
+    if response.status_code not in (200, 201, 204):
+        raise RuntimeError(
+            f"post_day_items failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
+        )
+
+    day_summary = sync_day_from_fitatu(db, client, date)
+    return {
+        "ok": True,
+        "plan_day_diet_item_id": plan_id,
+        "date": date,
+        "meal_key": meal_key,
+        "day": day_summary.model_dump(mode="json") if hasattr(day_summary, "model_dump") else day_summary,
+    }
+
+
+def update_meal_item(
+    db: Session,
+    client: FitatuClient,
+    date: str,
+    meal_key: str,
+    plan_day_diet_item_id: str,
+    new_measure_quantity: float,
+) -> dict:
+    """Replace = POST new item, then DELETE old. Per spec §15.1 C3 patch."""
+    _validate_day_date(date)
+    _validate_meal_key(meal_key)
+    if new_measure_quantity <= 0:
+        raise ValueError(f"new_measure_quantity must be > 0 (got {new_measure_quantity})")
+
+    day_payload = client.get_day(date)
+    meal = (day_payload.get("dietPlan") or {}).get(meal_key) or {}
+    items = meal.get("items") or []
+    existing = next((i for i in items if str(i.get("planDayDietItemId")) == str(plan_day_diet_item_id)), None)
+    if existing is None:
+        raise RuntimeError(
+            f"plan_day_diet_item_id {plan_day_diet_item_id!r} not found in {meal_key} of {date}"
+        )
+
+    product_id = existing.get("productId")
+    measure_id = existing.get("measureId")
+    if product_id is None or measure_id is None:
+        raise RuntimeError(
+            f"existing item missing productId/measureId; cannot rebuild for update"
+        )
+
+    product = _resolve_product_for_meal_item(db, client, int(product_id))
+    new_plan_id, new_item = _build_meal_item_payload(
+        client, product, meal_key, int(measure_id), new_measure_quantity
+    )
+
+    post_resp = client.post_day_items(date, [new_item])
+    if post_resp.status_code not in (200, 201, 204):
+        raise RuntimeError(
+            f"update_meal_item POST failed: {post_resp.status_code} {getattr(post_resp, 'text', '')[:200]}"
+        )
+
+    cleanup_failed = False
+    warnings: list[str] = []
+    del_resp = client.delete_day_item(date, meal_key, plan_day_diet_item_id)
+    if del_resp.status_code not in (200, 204):
+        cleanup_failed = True
+        warnings.append(
+            f"old item {plan_day_diet_item_id} must be deleted manually via delete_meal_item"
+        )
+        logger.warning(
+            "update_meal_item cleanup DELETE failed status=%s pid=%s",
+            del_resp.status_code, plan_day_diet_item_id,
+        )
+
+    day_summary = sync_day_from_fitatu(db, client, date)
+    return {
+        "ok": True,
+        "plan_day_diet_item_id": new_plan_id,
+        "replaced_from": plan_day_diet_item_id,
+        "date": date,
+        "meal_key": meal_key,
+        "cleanup_failed": cleanup_failed,
+        "warnings": warnings,
+        "day": day_summary.model_dump(mode="json") if hasattr(day_summary, "model_dump") else day_summary,
+    }
+
+
+def delete_meal_item(
+    db: Session,
+    client: FitatuClient,
+    date: str,
+    meal_key: str,
+    plan_day_diet_item_id: str,
+    delete_all_related_meals: bool = False,
+) -> dict:
+    _validate_day_date(date)
+    _validate_meal_key(meal_key)
+
+    response = client.delete_day_item(
+        date, meal_key, plan_day_diet_item_id, delete_all_related_meals=delete_all_related_meals,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"delete_meal_item failed: {response.status_code} {getattr(response, 'text', '')[:200]}"
+        )
+
+    day_summary = sync_day_from_fitatu(db, client, date)
+    return {
+        "ok": True,
+        "deleted_plan_day_diet_item_id": plan_day_diet_item_id,
+        "date": date,
+        "meal_key": meal_key,
+        "day": day_summary.model_dump(mode="json") if hasattr(day_summary, "model_dump") else day_summary,
+    }
