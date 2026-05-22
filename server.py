@@ -424,8 +424,10 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
     @mcp.tool(
         name="search_products",
         description=(
-            "Search products. scope='custom' uses local LIKE; scope='catalog' raises pending payload contract; "
-            "scope='all' returns custom results plus a warning."
+            "Search products. scope='custom' = local LIKE over cached/created products. "
+            "scope='catalog' = live Fitatu search (PRODUCT + RECIPE), via "
+            "GET /api/search/food/user/{uid}. scope='all' = custom first, then catalog "
+            "with custom rows de-duplicated by product id."
         ),
     )
     def mcp_search_products(query: str, scope: str = "custom", limit: int = 20) -> dict:
@@ -437,28 +439,53 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
         if not 1 <= limit <= 50:
             raise ValueError("limit must be between 1 and 50")
 
-        if scope == "catalog":
-            raise RuntimeError(
-                "Catalog search not yet wired — payload contract pending. "
-                "Use scope='custom' or pass exact product_id."
-            )
+        custom_results: list[dict] = []
+        if scope in {"custom", "all"}:
+            with SessionLocal() as db:
+                rows = service.search_products_local(db, q, "custom", limit)
+                custom_results = [
+                    {
+                        "id": r.id,
+                        "name": r.name,
+                        "brand": r.brand,
+                        "energy": r.energy,
+                        "source": r.source,
+                        "type": "PRODUCT",
+                    }
+                    for r in rows
+                ]
 
-        with SessionLocal() as db:
-            rows = service.search_products_local(db, q, scope, limit)
-            results = [
-                {
-                    "id": r.id,
-                    "name": r.name,
-                    "brand": r.brand,
-                    "energy": r.energy,
-                    "source": r.source,
-                }
-                for r in rows
-            ]
-        envelope = {"ok": True, "query": q, "scope": scope, "results": results}
-        if scope == "all":
-            envelope["warnings"] = ["catalog search unavailable — payload contract pending"]
-        return envelope
+        catalog_results: list[dict] = []
+        if scope in {"catalog", "all"}:
+            _ensure_user_id()
+            try:
+                hits = client.search_food(q, page=1, limit=limit)
+            except RuntimeError as exc:
+                logger.warning("search_food upstream failed: %s", exc)
+                hits = []
+            seen_ids = {r["id"] for r in custom_results}
+            for hit in hits:
+                fid = hit.get("foodId")
+                if fid is None or fid in seen_ids:
+                    continue
+                catalog_results.append({
+                    "id": fid,
+                    "name": hit.get("name"),
+                    "brand": hit.get("brand") or None,
+                    "energy": hit.get("energy"),
+                    "source": "catalog",
+                    "type": (hit.get("type") or "").upper() or None,
+                })
+                seen_ids.add(fid)
+
+        if scope == "custom":
+            results = custom_results
+        elif scope == "catalog":
+            results = catalog_results[:limit]
+        else:
+            results = (custom_results + catalog_results)[:limit]
+
+        return {"ok": True, "query": q, "scope": scope, "results": results}
 
     # -- Meal-item write tools (Group 9, spec §15 — PRIMARY user goal) --
 

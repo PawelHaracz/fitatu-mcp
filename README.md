@@ -42,7 +42,7 @@ All date params are `YYYY-MM-DD`. Read tools accept a `start_date` and optional 
 |------|-------------|
 | `create_custom_product(name, energy, protein, fat, carbohydrate, ...)` | Create a user-owned product. Macros per 100g. Returns the new product id + local cache row. |
 | `get_product(product_id)` | Fetch a product by id. Reads local cache first; falls through to Fitatu on miss. |
-| `search_products(query, scope="custom", limit=20)` | Search by name. `scope="custom"` returns local LIKE matches. `scope="catalog"` raises (payload contract pending — use `search_food` via internal client for now). `scope="all"` returns custom-only + a warning. |
+| `search_products(query, scope="custom", limit=20)` | Search by name. `scope="custom"` = local LIKE over cached/custom products. `scope="catalog"` = live Fitatu search (PRODUCT + RECIPE hits via `GET /api/search/food/user/{uid}`). `scope="all"` = custom first, then catalog, deduplicated by product id. |
 | `delete_custom_product(product_id)` | Remove a user-owned product from both Fitatu and the local cache. **Gated by `FITATU_ALLOW_DELETE=true`**. |
 
 Writes hit `https://www.fitatu.com/api` (the canonical web app cluster). Reads still go to `https://pl-pl.fitatu.com`. Both can be overridden with `FITATU_BASE_URL_READ` / `FITATU_BASE_URL_WRITE`.

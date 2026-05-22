@@ -1,9 +1,10 @@
-"""Group 6 tests: search_products Path B (custom scope = local LIKE)."""
+"""Group 6 tests: search_products — local (custom) + live Fitatu (catalog) wiring."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -52,6 +53,9 @@ def app_mcp(monkeypatch):
     monkeypatch.setattr(server, "SessionLocal", TestSession)
 
     app, mcp = server.build_app(_base_env())
+    # Pre-seed user_id so _ensure_user_id() short-circuits and skips real login
+    app.state.fitatu_client.user_id = "42"
+    app.state.fitatu_client.token = "tok"
 
     # Seed
     from mcp_server.service import upsert_product
@@ -74,20 +78,53 @@ def test_search_scope_custom_returns_local_like_matches(app_mcp):
     assert envelope["results"][0]["name"] == "Greek Yogurt"
 
 
-def test_search_scope_catalog_raises(app_mcp):
+def test_search_scope_catalog_calls_fitatu_search_food(app_mcp):
     app, mcp = app_mcp
-    with pytest.raises(Exception) as exc_info:
-        _call_tool_sync(mcp, "search_products", {"query": "Apple", "scope": "catalog", "limit": 10})
-    assert "Catalog search not yet wired" in str(exc_info.value)
+    fake_hits = [
+        {"foodId": 555, "name": "Apple PRODUCT", "brand": "Acme", "energy": 52, "type": "PRODUCT"},
+        {"foodId": 777, "name": "Apple pie RECIPE", "brand": "", "energy": 250, "type": "RECIPE"},
+    ]
+    with patch("mcp_server.fitatu_client.FitatuClient.search_food", return_value=fake_hits) as mock_search:
+        envelope = _call_tool_sync(mcp, "search_products", {"query": "Apple", "scope": "catalog", "limit": 10})
+
+    mock_search.assert_called_once()
+    assert envelope["ok"] is True
+    assert envelope["scope"] == "catalog"
+    ids = [r["id"] for r in envelope["results"]]
+    assert 555 in ids and 777 in ids
+    apple = next(r for r in envelope["results"] if r["id"] == 555)
+    assert apple["type"] == "PRODUCT"
+    assert apple["source"] == "catalog"
 
 
-def test_search_scope_all_returns_with_warnings(app_mcp):
+def test_search_scope_all_merges_custom_then_catalog_dedup(app_mcp):
     app, mcp = app_mcp
-    envelope = _call_tool_sync(mcp, "search_products", {"query": "Yogurt", "scope": "all", "limit": 10})
+    # `Greek Yogurt` is the custom hit (id=2). Catalog response shadows it with the same id
+    # to prove dedup, and adds a fresh id.
+    fake_hits = [
+        {"foodId": 2, "name": "Greek Yogurt (catalog dup)", "brand": "", "energy": 60, "type": "PRODUCT"},
+        {"foodId": 999, "name": "Greek Yogurt Drink", "brand": "Brand", "energy": 75, "type": "PRODUCT"},
+    ]
+    with patch("mcp_server.fitatu_client.FitatuClient.search_food", return_value=fake_hits):
+        envelope = _call_tool_sync(mcp, "search_products", {"query": "Yogurt", "scope": "all", "limit": 10})
+
     assert envelope["ok"] is True
     assert envelope["scope"] == "all"
-    assert "warnings" in envelope
-    assert any("catalog" in w.lower() for w in envelope["warnings"])
+    ids = [r["id"] for r in envelope["results"]]
+    # custom (id=2) appears once; id=999 is the fresh catalog hit
+    assert ids.count(2) == 1
+    assert 999 in ids
+    # custom row comes first
+    assert envelope["results"][0]["id"] == 2
+    assert envelope["results"][0]["source"] == "custom"
+
+
+def test_search_scope_catalog_upstream_failure_returns_empty(app_mcp):
+    app, mcp = app_mcp
+    with patch("mcp_server.fitatu_client.FitatuClient.search_food", side_effect=RuntimeError("upstream 500")):
+        envelope = _call_tool_sync(mcp, "search_products", {"query": "Apple", "scope": "catalog", "limit": 10})
+    assert envelope["ok"] is True
+    assert envelope["results"] == []
 
 
 def test_search_query_too_short_raises(app_mcp):
