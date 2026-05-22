@@ -337,6 +337,7 @@ def db_day_to_schema(day_row: DailyNutrition) -> DaySummarySchema:
 _PRODUCT_COLUMN_KEYS = {
     "name", "brand", "energy", "protein", "fat", "carbohydrate",
     "fiber", "sodium", "salt", "saturated_fat", "sugars", "cholesterol",
+    "barcode",
 }
 
 _FITATU_TO_LOCAL = {

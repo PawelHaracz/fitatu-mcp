@@ -108,6 +108,7 @@ class Product(Base):
     saturated_fat: Mapped[float | None] = mapped_column(Float, nullable=True)
     sugars: Mapped[float | None] = mapped_column(Float, nullable=True)
     cholesterol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    barcode: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     raw: Mapped[str | None] = mapped_column(String, nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="custom")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

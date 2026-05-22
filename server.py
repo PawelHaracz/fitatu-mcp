@@ -107,7 +107,8 @@ def build_app(env: Mapping[str, str] | None = None) -> tuple[FastAPI, FastMCP]:
     """Construct (FastAPI, FastMCP) pair from env mapping.
 
     Env keys consumed:
-      - FITATU_USERNAME, FITATU_PASSWORD, FITATU_API_SECRET, MCP_API_KEY (required)
+      - FITATU_USERNAME, FITATU_PASSWORD, MCP_API_KEY (required)
+      - FITATU_API_SECRET (optional; built-in default is used when unset)
       - FITATU_BASE_URL_READ, FITATU_BASE_URL_WRITE (optional client overrides)
       - FITATU_ALLOW_DELETE (default false; gates destructive tools)
       - FITATU_TODAY_TTL_SECONDS, MCP_ENABLE_DNS_REBINDING_PROTECTION, MCP_ALLOWED_HOSTS (server config)

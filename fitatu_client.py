@@ -14,9 +14,10 @@ BASE_URL_WRITE = "https://www.fitatu.com/api"
 LOGIN_PATH = "/api/login"
 REFRESH_PATH = "/api/token/refresh"
 
-FITATU_API_SECRET = os.getenv("FITATU_API_SECRET")
-if not FITATU_API_SECRET:
-    raise RuntimeError("FITATU_API_SECRET must be set")
+# Public client identifier baked into the Fitatu web bundle. Same for all users.
+# Override via FITATU_API_SECRET only if Fitatu rotates it (rare).
+_DEFAULT_API_SECRET = "PYRXtfs88UDJMuCCrNpLV"
+FITATU_API_SECRET = os.getenv("FITATU_API_SECRET") or _DEFAULT_API_SECRET
 
 BASE_HEADERS = {
     "accept": "application/json; version=v3",

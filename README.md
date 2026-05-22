@@ -51,7 +51,7 @@ Writes hit `https://www.fitatu.com/api` (the canonical web app cluster). Reads s
 
 ```bash
 cp .env.example .env
-# Fill in FITATU_USERNAME / FITATU_PASSWORD / FITATU_API_SECRET,
+# Fill in FITATU_USERNAME / FITATU_PASSWORD,
 # generate MCP_API_KEY and N8N_ENCRYPTION_KEY with `openssl rand -hex 32`.
 docker compose up -d --build
 ```
@@ -67,9 +67,11 @@ Inside the compose network, n8n reaches the MCP server at `http://fitatu-mcp:800
 
 To pull the pre-built image instead of building locally, set `FITATU_MCP_IMAGE` in `.env` (e.g. `ghcr.io/pawelharacz/fitatu-mcp:latest`) and run `docker compose pull && docker compose up -d`.
 
-## Where to find `FITATU_API_SECRET`
+## About `FITATU_API_SECRET`
 
-The Fitatu mobile/web client signs requests with a static `api-secret` header. Inspect any authenticated XHR in DevTools (Network tab) and copy that value. The MCP server uses the same header so the upstream login flow is accepted.
+The Fitatu mobile/web client signs requests with a static `api-secret` header. This value is **public** — it's baked into the JavaScript bundle served to every browser at `https://www.fitatu.com/app/`, identical for all users, and has been stable for years. It identifies the client app, not the user; the actual user auth is the JWT issued by `POST /api/login`.
+
+Because it's a public client identifier rather than a real secret, a working default ships in `fitatu_client.py` and **you do not need to set `FITATU_API_SECRET`** unless Fitatu rotates the value. If they do, grab the new one from any authenticated XHR in the Fitatu web app DevTools (Network tab → request headers → `api-secret`) and set it in `.env`.
 
 ## n8n integration
 
@@ -89,7 +91,7 @@ The Python files use relative imports, so the package must be importable as `mcp
 pip install -r requirements.txt
 export FITATU_USERNAME=you@example.com
 export FITATU_PASSWORD=…
-export FITATU_API_SECRET=…
+# FITATU_API_SECRET is optional — a working default is built in.
 export MCP_API_KEY=$(openssl rand -hex 32)
 export FITATU_DB_FILE=./fitatu_nutrition.db
 python -m uvicorn mcp_server.server:app --host 0.0.0.0 --port 8000
@@ -117,7 +119,7 @@ The image runs as UID 1000, exposes 8000, declares a `/health` HEALTHCHECK, and 
 |----------|---------|---------|
 | `FITATU_USERNAME` | — | Fitatu account email. |
 | `FITATU_PASSWORD` | — | Fitatu account password. |
-| `FITATU_API_SECRET` | — | `api-secret` header value used by the Fitatu app. |
+| `FITATU_API_SECRET` | `PYRXtfs88UDJMuCCrNpLV` (built-in) | Public client identifier; override only if Fitatu rotates it. See "About `FITATU_API_SECRET`" below. |
 | `MCP_API_KEY` | — | Shared secret required on every MCP request. |
 | `FITATU_DB_FILE` | `/data/fitatu_nutrition.db` | SQLite path inside the container. |
 | `FITATU_TODAY_TTL_SECONDS` | `300` | How long today's row is treated as fresh. |
