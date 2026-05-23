@@ -146,3 +146,9 @@ python3 -m venv .venv
 ```
 
 Tests use in-memory SQLite and mock all Fitatu HTTP. No live credentials needed.
+
+## License
+
+This project is released under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify, and share it freely for personal, research, educational, or other noncommercial purposes. **Commercial use is not permitted** without a separate agreement.
+
+This repository is a fork of [karolswitala/fitatu-mcp](https://github.com/karolswitala/fitatu-mcp), which is published without an explicit license. The PolyForm terms apply to modifications and additions contributed in this fork; the unmodified upstream code remains subject to the upstream author's rights.
