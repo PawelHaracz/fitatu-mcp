@@ -1,11 +1,10 @@
-# fitatu-mcp + n8n
+# fitatu-mcp
 #
 # Usage:
 #   1) cp .env.example .env && edit credentials
 #   2) docker compose up -d --build
-#   3) Open n8n at http://localhost:5678 and finish owner setup
-#   4) In n8n add an "MCP" credential / node pointing at:
-#        URL:    http://fitatu-mcp:8000/mcp/
+#   3) Point your MCP client at:
+#        URL:    http://localhost:8000/mcp/
 #        Header: Authorization: Bearer ${MCP_API_KEY}
 #
 # Pull the published image instead of building locally:
@@ -36,9 +35,6 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    # Expose to host only if you also want to call it from outside the compose
-    # network (e.g. local Claude Desktop). Comment out otherwise — n8n reaches
-    # it on the internal network as http://fitatu-mcp:8000.
     ports:
       - "${FITATU_MCP_PORT:-8000}:8000"
 

@@ -59,18 +59,11 @@ Writes hit `https://www.fitatu.com/api` (the canonical web app cluster). Reads s
 ```bash
 cp .env.example .env
 # Fill in FITATU_USERNAME / FITATU_PASSWORD,
-# generate MCP_API_KEY and N8N_ENCRYPTION_KEY with `openssl rand -hex 32`.
+# generate MCP_API_KEY with `openssl rand -hex 32`.
 docker compose up -d --build
 ```
 
-This brings up two services:
-
-| Service | URL | Purpose |
-|---------|-----|---------|
-| `fitatu-mcp` | `http://localhost:8000/mcp/` | The MCP server (auth: bearer `MCP_API_KEY`). |
-| `n8n` | `http://localhost:5678` | Workflow editor; finish owner setup on first visit. |
-
-Inside the compose network, n8n reaches the MCP server at `http://fitatu-mcp:8000/mcp/`. The SQLite cache lives in the `fitatu_data` volume; n8n state in `n8n_data`.
+This brings up the MCP server at `http://localhost:8000/mcp/` (auth: bearer `MCP_API_KEY`). The SQLite cache lives in the `fitatu_data` volume.
 
 To pull the pre-built image instead of building locally, set `FITATU_MCP_IMAGE` in `.env` (e.g. `ghcr.io/pawelharacz/fitatu-mcp:latest`) and run `docker compose pull && docker compose up -d`.
 
@@ -80,15 +73,15 @@ The Fitatu mobile/web client signs requests with a static `api-secret` header. T
 
 Because it's a public client identifier rather than a real secret, a working default ships in `fitatu_client.py` and **you do not need to set `FITATU_API_SECRET`** unless Fitatu rotates the value. If they do, grab the new one from any authenticated XHR in the Fitatu web app DevTools (Network tab → request headers → `api-secret`) and set it in `.env`.
 
-## n8n integration
+## MCP client setup
 
-In a workflow, use the **MCP Client** node (or the AI Agent's tool selector) configured as:
+Point any MCP client (Claude Desktop, Docker MCP Gateway, custom integration) at the server:
 
 - Transport: **HTTP Streamable**
-- URL: `http://fitatu-mcp:8000/mcp/`
+- URL: `http://localhost:8000/mcp/` (or `http://fitatu-mcp:8000/mcp/` from inside the compose network)
 - Headers: `Authorization: Bearer <MCP_API_KEY>`
 
-Then call `sync_day` once for the date range you care about, and chain `get_day_macros` / `get_day_summary` for downstream work.
+Typical flow: call `sync_day` once for the date range you care about, then chain `get_day_macros` / `get_day_summary` for downstream work.
 
 ## Local run (without Docker)
 
